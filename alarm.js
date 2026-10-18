@@ -98,6 +98,10 @@
   }
 
   function wakeStatusText() {
+    var latest=autoWakeObservation || autoColdStartObservation;
+    if(latest)return 'Для автозапуска Lampa заметила: '+latest.reason+
+      ', простой '+Math.round(latest.inactiveMs/60000)+' мин. '+
+      'Это не подтверждает включение телевизора системным таймером.';
     if (!wakeObservation) return 'После запуска Lampa признаков пробуждения не было.';
     return 'Наблюдение: ' + wakeObservation.reason + ', ' +
       Math.round(wakeObservation.inactivityMs / 60000) + ' мин простоя.';
@@ -2455,10 +2459,17 @@
     var plan=autoSourcePlan(data);
     var enabledText=!data.enabled?'будильник выключен':
       !data.autoPlayback?'автозапуск выключен':'автозапуск включён';
+    var signal=autoWakeObservation ||
+      (data.autoStartMode==='resume_or_start'?autoColdStartObservation:null);
+    var state=signal?'Последнее событие: '+signal.reason:
+      'Признак пробуждения ещё не обнаружен';
+    if(signal && lastInteractionAt>=signal.at)
+      state+=' (после него использовался пульт)';
     return 'Будильник '+data.time+', '+enabledText+
       ', дней '+data.days.length+'/7. '+plan.message+
-      '. После сна: '+(data.autoStartMode==='resume_only'?
-        'только возобновление Lampa':'возобновление или новый запуск Lampa');
+      '. Режим: '+(data.autoStartMode==='resume_only'?
+        'только возобновление Lampa':'возобновление или новый запуск Lampa')+
+      '. '+state;
   }
 
   function autoStatusText() {
