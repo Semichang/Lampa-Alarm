@@ -1,9 +1,10 @@
 (function () {
   'use strict';
 
-  // Lampa Alarm v0.7.3: one-shot startup test and manual TorrServer replay.
-  // Scheduled playback and Android system-volume control are still disabled.
-  var VERSION = '0.7.3';
+  // Lampa Alarm v0.8.0: one-shot startup test and manual TorrServer replay.
+  // Automatic scheduled playback is opt-in and requires a wake/start signal.
+  // Android system-volume control is still disabled.
+  var VERSION = '0.8.0';
   var COMPONENT = 'lampa_alarm';
   var PREFIX = 'la_';
   var ICON = '<svg viewBox="0 0 24 24" width="24" height="24" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v5l4 2" fill="none" stroke="currentColor" stroke-width="2"/></svg>';
@@ -18,8 +19,8 @@
     { id: 0, title: 'Воскресенье' }
   ];
 
-  if (window.__lampaAlarm073Loaded) return;
-  window.__lampaAlarm073Loaded = true;
+  if (window.__lampaAlarm080Loaded) return;
+  window.__lampaAlarm080Loaded = true;
 
   // Best-effort wake detection: this cannot identify the TV power-on reason.
   // Unknown/unobserved wake never triggers a wake-guarded alarm.
@@ -35,6 +36,11 @@
   var ONLINE_TTL_MS = 120000;
   var torrentLaunch = null;
   var onlineRoute = null;
+  var autoWakeObservation = null;
+  var autoColdStartObservation = null;
+  var autoStartupReadyAt = 0;
+  var autoSchedulePending = false;
+  var lastSeenSavedAt = 0;
 
   function markInteraction() { lastInteractionAt = Date.now(); }
 
@@ -55,6 +61,9 @@
     var now = Date.now();
     var gap = now - lastHeartbeatAt;
     lastHeartbeatAt = now;
+    if(!document.hidden && gap >= autoIdleThresholdMs())
+      autoWakeObserved('пауза таймера',gap,now);
+    saveActiveSeen(now,false);
     if (!document.hidden && gap >= wakeThresholdMs()) {
       rememberWake('пауза таймера', gap, now);
     }
@@ -67,19 +76,24 @@
     var now = Date.now();
     if (document.hidden) {
       hiddenAt = now;
+      save('last_active_seen_at',now);
       return;
     }
     if (hiddenAt !== null) {
       var dormant = now - hiddenAt;
+      autoWakeObserved('возврат приложения',dormant,now);
       rememberWake('возврат приложения', dormant, now);
       hiddenAt = null;
       if (dormant >= 10000) tryArmedStartupTest('возврат приложения', dormant);
     } else {
       var gap = now - lastHeartbeatAt;
+      if(gap >= autoIdleThresholdMs())
+        autoWakeObserved('возобновление таймера',gap,now);
       if (gap >= wakeThresholdMs()) rememberWake('пауза таймера', gap, now);
       if (gap >= 30000) tryArmedStartupTest('возобновление таймера', gap);
     }
     lastHeartbeatAt = now;
+    saveActiveSeen(now,false);
     checkSchedule();
   }
 
@@ -2260,6 +2274,8 @@
       return false;
 
     startupTestTriggered = true;
+    // A one-shot test takes priority over today's recurring scheduled alarm.
+    save('auto_last_attempt_date',keyForDate(new Date()));
     save('startup_test_enabled', false); // One-shot, consume before attempting.
     save('startup_test_origin', '');
 
@@ -2275,6 +2291,261 @@
     return true;
   }
 
+
+  // These are WebView lifecycle observations, not proof that the television
+  // turned on using Android TV's scheduled power-on setting.
+  function autoIdleThresholdMs() {
+    var minutes=Number(read('auto_min_sleep','15'));
+    return ([5,15,30,60].indexOf(minutes)>=0?minutes:15)*60000;
+  }
+
+  function autoClockWindowMs() {
+    var minutes=Number(read('auto_window','5'));
+    return ([1,3,5,10].indexOf(minutes)>=0?minutes:5)*60000;
+  }
+
+  function autoWakeObserved(reason, inactivity, now) {
+    if(!isFinite(inactivity) || inactivity<autoIdleThresholdMs())return;
+    autoWakeObservation={
+      at:now,inactiveMs:inactivity,reason:reason,session:startupSessionId
+    };
+    log('Scheduled alarm: app became active after '+reason+
+      ', idle '+Math.round(inactivity/1000)+' sec');
+  }
+
+  function saveActiveSeen(now,force) {
+    if(document.hidden)return;
+    if(force || now-lastSeenSavedAt>=60000) {
+      save('last_active_seen_at',now);
+      lastSeenSavedAt=now;
+    }
+  }
+
+  function initializeAutoLifecycle() {
+    var now=Date.now(),previous=Number(read('last_active_seen_at',0));
+    var idle=now-previous;
+    if(isFinite(previous)&&previous>0 &&
+       idle>=autoIdleThresholdMs() && idle<=24*60*60*1000){
+      autoColdStartObservation={
+        at:now,inactiveMs:idle,reason:'запуск Lampa после простоя',
+        session:startupSessionId
+      };
+    }
+    // Permit a few seconds for TV input after a cold start. User interaction
+    // during this interval cancels the automatic playback attempt.
+    autoStartupReadyAt=now+5000;
+    saveActiveSeen(now,true);
+  }
+
+  function autoDateSchedule(now,when,days,minutesAfter) {
+    var minute=timeMinutes(when);
+    if(minute<0)return null;
+    var windowMs=minutesAfter*60000;
+    // Try both today's and yesterday's scheduled clock time; yesterday
+    // matters for an alarm at 23:59 resuming after midnight.
+    for(var back=0;back<=1;back++){
+      var scheduled=new Date(now.getFullYear(),now.getMonth(),
+        now.getDate()-back,Math.floor(minute/60),minute%60,0,0);
+      var difference=now.getTime()-scheduled.getTime();
+      if(days.indexOf(scheduled.getDay())>=0 &&
+         difference>=0 && difference<=windowMs){
+        return {at:scheduled.getTime(),dateKey:keyForDate(scheduled),
+          time:when,ageMs:difference};
+      }
+    }
+    return null;
+  }
+
+  function autoWakeForSchedule(now,scheduledAt) {
+    var windowMs=autoClockWindowMs();
+    var mode=String(read('auto_start_mode','resume_or_start'));
+    var list=[];
+    if(autoWakeObservation)list.push(autoWakeObservation);
+    if(mode==='resume_or_start' && autoColdStartObservation)
+      list.push(autoColdStartObservation);
+    list.sort(function(a,b){return b.at-a.at;});
+    for(var i=0;i<list.length;i++){
+      var observation=list[i];
+      if(observation.session!==startupSessionId)continue;
+      if(observation.inactiveMs<autoIdleThresholdMs())continue;
+      if(now.getTime()<observation.at)continue;
+      // The device should wake approximately when the alarm was scheduled.
+      if(Math.abs(observation.at-scheduledAt)>windowMs)continue;
+      if(now.getTime()-observation.at>windowMs+30000)continue;
+      if(lastInteractionAt>=observation.at)continue;
+      return observation;
+    }
+    return null;
+  }
+
+  function autoSourcePlan(config) {
+    var series=config && config.selectedSeries;
+    if(!series)return {ok:false,message:'Сначала выбери сериал в его карточке'};
+    if(config.episode==='next')return {
+      ok:false,message:'Следующая непросмотренная серия пока не поддерживается'
+    };
+    var torrent=canLaunchTorrent();
+    var candidate=onlineReplayCandidate();
+    var online=Boolean(candidate && candidate.season && candidate.episode &&
+      onlineComponentSupported(candidate.component));
+    function available(type){
+      return type==='torrent'?torrent:online;
+    }
+    var desired=config.source;
+    if(desired==='torrent' || desired==='online'){
+      if(!available(desired))return {
+        ok:false,message:desired==='torrent'?
+          'Нет сохранённого файла TorrServer для выбранного сериала':
+          'Нет сохранённого и распознанного онлайн-эпизода'
+      };
+      return {ok:true,type:desired,message:desired==='torrent'?
+        'Сохранённая серия TorrServer':'Сохранённая онлайн-серия'};
+    }
+
+    // "Последний источник" means the most recent usable provider for this
+    // chosen series, not an unrelated series watched afterwards.
+    var recorded=[];
+    var last=lastPlayback();
+    if(last)recorded.push(last);
+    var history=playbackHistory();
+    for(var i=0;i<history.length;i++)recorded.push(history[i]);
+    var prefer='';
+    for(var j=0;j<recorded.length;j++){
+      var item=recorded[j];
+      if(item && String(item.seriesId)===series.id &&
+         String(item.source)===series.source &&
+         (item.sourceType==='torrent'||item.sourceType==='online')){
+        prefer=item.sourceType;break;
+      }
+    }
+    if(prefer && available(prefer)){
+      return {ok:true,type:prefer,message:'Последний источник: '+
+        (prefer==='torrent'?'TorrServer':'онлайн')};
+    }
+    // Fallback only when a saved matching source is actually available.
+    if(torrent)return {ok:true,type:'torrent',
+      message:prefer==='online'?'Онлайн недоступен; резерв TorrServer':
+        'Сохранённая серия TorrServer'};
+    if(online)return {ok:true,type:'online',
+      message:prefer==='torrent'?'TorrServer недоступен; резерв онлайн':
+        'Сохранённая онлайн-серия'};
+    return {ok:false,message:'Нет готового сохранённого источника для сериала'};
+  }
+
+  function autoLaunchStatus() {
+    var status=storedValue('auto_launch_status',null);
+    return status && typeof status==='object'?status:null;
+  }
+
+  function recordAutoStatus(status,message,info) {
+    var data={
+      status:status,message:plainLabel(message,190),
+      at:new Date().toISOString(),
+      dateKey:info&&info.dateKey||'',
+      time:info&&info.time||String(read('time','07:00')),
+      source:info&&info.source||'',
+      wake:info&&info.wake||''
+    };
+    save('auto_launch_status',data);
+    log('Scheduled auto: '+data.status+' / '+data.message);
+  }
+
+  function autoReadinessText() {
+    var data=settingsSnapshot();
+    var plan=autoSourcePlan(data);
+    var enabledText=!data.enabled?'будильник выключен':
+      !data.autoPlayback?'автозапуск выключен':'автозапуск включён';
+    return 'Будильник '+data.time+', '+enabledText+
+      ', дней '+data.days.length+'/7. '+(plan.ok?plan.message:plan.message)+
+      '. После сна: '+(data.autoStartMode==='resume_only'?
+        'только возобновление Lampa':'возобновление или новый запуск Lampa');
+  }
+
+  function autoStatusText() {
+    var data=autoLaunchStatus();
+    if(!data)return 'Автоматических попыток запуска пока не было';
+    var status=data.source==='torrent'?launchReport():
+      data.source==='online'?onlineStatus():null;
+    var actual='';
+    if(status && status.stage)actual='; плеер: '+status.message;
+    return data.message+actual+
+      (data.wake?'; событие: '+data.wake:'');
+  }
+
+  function autoPlaybackAtScheduledTime(config,schedule,observation) {
+    var now=new Date();
+    var latest=settingsSnapshot();
+    var existing=autoDateSchedule(now,latest.time,latest.days,
+      autoClockWindowMs()/60000);
+    if(!latest.enabled || !latest.autoPlayback || !existing ||
+       existing.dateKey!==schedule.dateKey ||
+       enabled('startup_test_enabled',false) || startupTestTriggered)
+      return;
+    if(String(read('auto_last_attempt_date',''))===schedule.dateKey)return;
+    // Re-check after the debounce: user interaction or activity may have
+    // occurred in the meantime.
+    if(!autoWakeForSchedule(now,existing.at) || document.hidden)return;
+    if(lastInteractionAt>=observation.at)return;
+
+    var source=autoSourcePlan(latest);
+    // A failed/missing source is recorded once per scheduled day, so the
+    // TV isn't interrupted by retries if the user starts using Lampa.
+    save('auto_last_attempt_date',schedule.dateKey);
+    if(!source.ok){
+      recordAutoStatus('unavailable',source.message,{
+        dateKey:schedule.dateKey,time:schedule.time,
+        wake:observation.reason
+      });
+      notice('Будильник: '+source.message);
+      return;
+    }
+
+    if((torrentLaunch && !torrentLaunch.finished) ||
+       (onlineRoute && !onlineRoute.finished) ||
+       launchInProgress ||
+       (Lampa.Player && typeof Lampa.Player.opened==='function' &&
+        Lampa.Player.opened())){
+      recordAutoStatus('skipped','Плеер занят; запуск не выполнен',{
+        dateKey:schedule.dateKey,time:schedule.time,source:source.type,
+        wake:observation.reason
+      });
+      return;
+    }
+    recordAutoStatus('starting','Запускаю '+source.message,{
+      dateKey:schedule.dateKey,time:schedule.time,source:source.type,
+      wake:observation.reason
+    });
+    var started=false;
+    try{
+      started=source.type==='torrent'?
+        launchTorrentSeries():startOnlineReplay(true);
+    }catch(e){log('Automatic player exception: '+e.message)}
+    if(!started) {
+      recordAutoStatus('failed','Не удалось начать воспроизведение',{
+        dateKey:schedule.dateKey,time:schedule.time,source:source.type,
+        wake:observation.reason
+      });
+    }
+  }
+
+  function checkAutomaticSchedule(now,data) {
+    if(!data.autoPlayback)return;
+    var window=autoClockWindowMs()/60000;
+    var schedule=autoDateSchedule(now,data.time,data.days,window);
+    if(!schedule || document.hidden)return;
+    if(String(read('auto_last_attempt_date',''))===schedule.dateKey)return;
+    if(autoSchedulePending || Date.now()<autoStartupReadyAt)return;
+    if(enabled('startup_test_enabled',false) || startupTestTriggered)return;
+    var observed=autoWakeForSchedule(now,schedule.at);
+    if(!observed)return; // No wake/start signal: keep the TV uninterrupted.
+
+    autoSchedulePending=true;
+    setTimeout(function(){
+      autoSchedulePending=false;
+      autoPlaybackAtScheduledTime(data,schedule,observed);
+    },2500);
+  }
+
   function settingsSnapshot() {
     var dayValues = [];
     for (var i = 0; i < 7; i++) {
@@ -2283,6 +2554,11 @@
     return {
       version: VERSION,
       enabled: enabled('enabled', false),
+      autoPlayback: enabled('auto_playback', false),
+      autoStartMode: String(read('auto_start_mode','resume_or_start')),
+      autoMinSleep: Number(read('auto_min_sleep','15')),
+      autoWindow: Number(read('auto_window','5')),
+      autoLastAttemptDate: String(read('auto_last_attempt_date','')),
       time: String(read('time', '07:00')),
       days: dayValues,
       source: String(read('source', 'last')),
@@ -2307,39 +2583,35 @@
       torrentBookmarkStatus: bookmarkDiagnosticMessage(),
       torrentLaunchStatus: launchReport(),
       onlineLaunchStatus: onlineStatus(),
-      onlineReplayCandidate: onlineReplayCandidate()
+      onlineReplayCandidate: onlineReplayCandidate(),
+      autoLaunchStatus: autoLaunchStatus()
     };
   }
   function checkSchedule() {
     try {
-      var data = settingsSnapshot();
-      if (!data.enabled) return;
-      var now = new Date();
-      var scheduled = timeMinutes(data.time);
-      if (scheduled < 0 || data.days.indexOf(now.getDay()) < 0) return;
-      var minute = now.getHours() * 60 + now.getMinutes();
-      // Allow ten minutes for Lampa to resume after TV power-on, not all day.
-      var allowedDelay = data.wakeOnly ? data.wakeWindowMinutes : 10;
-      if (minute < scheduled || minute > scheduled + allowedDelay) return;
-      var key = keyForDate(now);
-      if (data.wakeOnly) {
-        // A fresh opening of Lampa at 07:00 is NOT evidence that the TV woke.
-        // JavaScript cannot distinguish a TV wake from returning from another app.
-        if (!wakeObservation) return;
-        var scheduledAt = new Date(now.getFullYear(), now.getMonth(), now.getDate(),
-          Math.floor(scheduled / 60), scheduled % 60).getTime();
-        var windowMs = allowedDelay * 60000;
-        if (Math.abs(wakeObservation.at - scheduledAt) > windowMs ||
-            now.getTime() - wakeObservation.at > windowMs ||
-            lastInteractionAt >= wakeObservation.at) return;
+      var data=settingsSnapshot();
+      if(!data.enabled)return;
+      var now=new Date();
+      if(data.autoPlayback){
+        checkAutomaticSchedule(now,data);
+        return;
       }
-      if (data.lastRun === key) return;
-      save('last_run', key);
-      notice('Lampa Alarm: время будильника ' + data.time + '. Видео и громкость подключим в следующей версии.');
-      log('Schedule fired: ' + key + ' ' + data.time);
-    } catch (e) {
-      log('Schedule error: ' + e.message);
-    }
+      // Keep the legacy notification-only option for users who have not
+      // enabled automatic scheduled playback.
+      var schedule=autoDateSchedule(now,data.time,data.days,
+        data.wakeOnly?data.wakeWindowMinutes:10);
+      if(!schedule || data.lastRun===schedule.dateKey)return;
+      if(data.wakeOnly){
+        if(!wakeObservation)return;
+        var allowedDelay=data.wakeWindowMinutes*60000;
+        if(Math.abs(wakeObservation.at-schedule.at)>allowedDelay ||
+           now.getTime()-wakeObservation.at>allowedDelay ||
+           lastInteractionAt>=wakeObservation.at)return;
+      }
+      save('last_run',schedule.dateKey);
+      notice('Lampa Alarm: время будильника '+data.time+'. Автозапуск видео отключён.');
+      log('Scheduled notification: '+schedule.dateKey+' '+data.time);
+    }catch(e){log('Schedule error: '+e.message);}
   }
   function addParam(name, type, label, description, defaultValue, values, callback) {
     var param = { name: PREFIX + name, type: type, 'default': defaultValue };
@@ -2370,7 +2642,32 @@
 
     addTitle('Расписание');
     addParam('enabled', 'trigger', 'Будильник включён',
-      'Проверка времени работает только пока Lampa запущена или возобновила работу.', false);
+      'Главный переключатель расписания. Телевизор включается собственным таймером.', false);
+    addParam('auto_playback','trigger','Запускать сериал автоматически',
+      'После пробуждения Lampa и в выбранное время запустить сохранённую серию. '+
+      'По умолчанию выключено.',false,null,function(value){
+        if(value===true || String(value)==='true')
+          notice('Автозапуск включён. Проверь источник, серию и режим пробуждения.');
+      });
+    addParam('auto_start_mode','select','Как распознавать включение',
+      '«Только после сна» безопаснее. «Также при запуске Lampa» может '+
+      'сработать и при ручном открытии приложения в указанное время.',
+      'resume_or_start',{
+        resume_only:'Только после наблюдаемого сна Lampa',
+        resume_or_start:'После сна или нового запуска Lampa'
+      });
+    addParam('auto_min_sleep','select','Минимальное время простоя',
+      'Для автоматического запуска Lampa должна быть неактивна хотя бы столько.',
+      '15',{'5':'5 минут','15':'15 минут','30':'30 минут','60':'60 минут'});
+    addParam('auto_window','select','Допустимая задержка запуска',
+      'Через сколько минут после заданного времени ещё разрешено начать запуск.',
+      '5',{'1':'1 минута','3':'3 минуты','5':'5 минут','10':'10 минут'});
+    addParam('auto_readiness','button','Проверить готовность автозапуска',
+      'Проверить время, выбранный источник, серию и состояние расписания.',
+      '',null,function(){notice(autoReadinessText())});
+    addParam('auto_last_result','button','Последняя попытка автозапуска',
+      'Покажет попытку по расписанию и результат плеера.',
+      '',null,function(){notice(autoStatusText())});
     Lampa.SettingsApi.addParam({
       component:COMPONENT,
       param:{name:PREFIX+'time_picker',type:'button'},
@@ -2392,9 +2689,9 @@
     }
 
     addTitle('Защита от случайного запуска (эксперимент)');
-    addParam('wake_only', 'trigger', 'Только после пробуждения',
-      'Сработает лишь если Lampa заметила долгую паузу и возобновление. ' +
-      'Не всегда распознаёт включение TV. По умолчанию выключено.', false);
+    addParam('wake_only', 'trigger', 'Только после пробуждения (уведомления)',
+      'Ограничивает только старые тестовые уведомления. Автозапуск '+
+      'в любом случае проверяет пробуждение отдельно.', false);
     addParam('min_sleep', 'select', 'Минимальный простой',
       'Не менее скольких минут Lampa должна быть неактивна.', '30',
       { '15': '15 минут', '30': '30 минут', '60': '1 час' });
@@ -2451,13 +2748,15 @@
       'Удалить запись о последней серии, не затрагивая историю Lampa.', '', null,
       clearLastPlayback);
 
-    addTitle('Планируемое воспроизведение (пока не активно)');
+    addTitle('Источник и серия для автоматического запуска');
     addParam('source', 'select', 'Источник серии',
-      'Сохранение предпочтения: воспроизведение подключим позже.', 'last',
-      { last: 'Последний источник', online: 'Онлайн', torrent: 'TorrServer' });
-    addParam('episode', 'select', 'Серия',
-      'Сохранение предпочтения: поиск серии подключим позже.', 'resume',
-      { resume: 'Продолжить', next: 'Следующая непросмотренная', repeat: 'Повторить последнюю' });
+      'Последний доступный источник выбранного сериала или явный онлайн/TorrServer.',
+      'last',{last:'Последний работающий',online:'Онлайн',torrent:'TorrServer'});
+    addParam('episode', 'select', 'Какая серия',
+      'Сейчас автоматически запускается сохранённая серия. '+
+      'Поиск следующей ещё не поддерживается.', 'resume',
+      {resume:'Сохранённая (продолжить)',repeat:'Повторить сохранённую',
+       next:'Следующая (пока недоступно)'});
 
     addTitle('Плавная громкость (пока не активно)');
     addParam('volume_mode', 'select', 'Конечная громкость',
@@ -2540,7 +2839,7 @@
     addParam('test', 'button', 'Проверить уведомление',
       'Покажет тестовое уведомление. Видео не запустится, громкость не изменится.', '', null,
       function () {
-        notice('Lampa Alarm 0.7.3: тест пройден, настройки доступны.');
+        notice('Lampa Alarm 0.8.0: тест пройден, настройки доступны.');
         log('Manual test performed');
       });
     addParam('status', 'button', 'Показать текущие настройки',
@@ -2561,7 +2860,7 @@
       setupSettings();
     } catch (e) {
       log('Setup failed: ' + e.message);
-      notice('Lampa Alarm 0.7.3: ошибка регистрации настроек');
+      notice('Lampa Alarm 0.8.0: ошибка регистрации настроек');
     }
     // Let the native Settings.main().update() build the menu entry and bind
     // the built-in hover:enter handler. Never append a data-static fallback.
@@ -2603,12 +2902,14 @@
         log('Player listener not available');
       }
     } catch (e) { log('Player subscription error: ' + e.message); }
+    initializeAutoLifecycle();
     setInterval(checkHeartbeat, 15000);
     // A cold WebView startup is different from an already running app.
     // A suspended WebView is handled by visibility/focus or a long timer gap.
     startupTimer = setTimeout(function () {
       tryArmedStartupTest('новый запуск', 0);
-    }, 4500);
+      checkSchedule();
+    }, 5500);
     window.addEventListener('focus', visibilityChanged);
     document.addEventListener('visibilitychange', visibilityChanged);
     document.addEventListener('keydown', markInteraction, false);
@@ -2618,6 +2919,12 @@
     window.LampaAlarm = {
       version: VERSION,
       getConfig: settingsSnapshot,
+      getAutoLaunchStatus: autoLaunchStatus,
+      getAutoReadiness: autoReadinessText,
+      getAutoSourcePlan: function(){return autoSourcePlan(settingsSnapshot())},
+      getAutoWake: function(){
+        return autoWakeObservation || autoColdStartObservation || null;
+      },
       getSelectedSeries: selectedSeries,
       getLastPlayback: lastPlayback,
       getPlaybackHistory: playbackHistory,
@@ -2649,7 +2956,7 @@
         } : null;
       },
       check: checkSchedule,
-      test: function () { notice('Lampa Alarm 0.7.3: тест пройден.'); }
+      test: function () { notice('Lampa Alarm 0.8.0: тест пройден.'); }
     };
     log('Initialized');
   }
