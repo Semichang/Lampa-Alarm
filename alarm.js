@@ -1,9 +1,9 @@
 (function () {
   'use strict';
 
-  // Lampa Alarm v0.2.0: settings and schedule notification only.
+  // Lampa Alarm v0.2.1: settings and schedule notification only.
   // This version intentionally does not start videos or change Android volume.
-  var VERSION = '0.2.0';
+  var VERSION = '0.2.1';
   var COMPONENT = 'lampa_alarm';
   var PREFIX = 'la_';
   var ICON = '<svg viewBox="0 0 24 24" width="24" height="24" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v5l4 2" fill="none" stroke="currentColor" stroke-width="2"/></svg>';
@@ -18,7 +18,7 @@
     { id: 0, title: 'Воскресенье' }
   ];
 
-  if (window.__lampaAlarm020Loaded) return;
+  if (window.__lampaAlarm021Loaded) return;
   window.__lampaAlarm020Loaded = true;
 
   function log(message) {
@@ -101,7 +101,10 @@
   }
   function addParam(name, type, label, description, defaultValue, values, callback) {
     var param = { name: PREFIX + name, type: type, 'default': defaultValue };
-    if (values) param.values = values;
+    // Lampa Params.update() expects a string mapping for input fields.
+    // Without it, some versions throw while opening the settings screen.
+    if (type === 'input') param.values = values == null ? '' : values;
+    else if (values) param.values = values;
     Lampa.SettingsApi.addParam({
       component: COMPONENT,
       param: param,
@@ -166,7 +169,7 @@
     addParam('test', 'button', 'Проверить уведомление',
       'Покажет тестовое уведомление. Видео не запустится, громкость не изменится.', '', null,
       function () {
-        notice('Lampa Alarm 0.2.0: тест пройден, настройки доступны.');
+        notice('Lampa Alarm 0.2.1: тест пройден, настройки доступны.');
         log('Manual test performed');
       });
     addParam('status', 'button', 'Показать текущие настройки',
@@ -179,40 +182,6 @@
 
     log('SettingsApi registered');
   }
-  function fallbackMenu() {
-    try {
-      var main = Lampa.Settings.main();
-      if (!main || !main.render) return;
-      var body = main.render();
-      if (!body || !body.find || body.find('[data-component="' + COMPONENT + '"]').length) return;
-      var html = '<div class="settings-folder selector lampa-alarm-fallback" data-component="' +
-        COMPONENT + '" data-static="true">' +
-        '<div class="settings-folder__icon">' + ICON + '</div>' +
-        '<div class="settings-folder__name">Будильник</div></div>';
-      var anchor = body.find('[data-component="more"]');
-      if (anchor.length) anchor.after(html);
-      else body.append(html);
-      if (main.update) main.update();
-      log('Fallback menu entry added');
-    } catch (e) { log('Fallback error: ' + e.message); }
-  }
-  function bindFallback(event) {
-    try {
-      if (!event || event.name !== 'main' || !event.body) return;
-      event.body.find('.lampa-alarm-fallback')
-        .off('hover:enter.lampaAlarm')
-        .on('hover:enter.lampaAlarm', function () {
-          try {
-            Lampa.Settings.create(COMPONENT, {
-              onBack: function () { Lampa.Settings.create('main'); }
-            });
-          } catch (e) {
-            log('Open alarm settings failed: ' + e.message);
-            notice('Не удалось открыть настройки будильника.');
-          }
-        });
-    } catch (e) { log('Bind fallback error: ' + e.message); }
-  }
   function init() {
     if (started) return;
     if (!window.Lampa || !Lampa.SettingsApi || !Lampa.Settings) return;
@@ -221,12 +190,14 @@
       setupSettings();
     } catch (e) {
       log('Setup failed: ' + e.message);
-      notice('Lampa Alarm 0.2.0: ошибка регистрации настроек');
+      notice('Lampa Alarm 0.2.1: ошибка регистрации настроек');
     }
-    try { Lampa.Settings.listener.follow('open', bindFallback); } catch (e) {
-      log('Settings listener error: ' + e.message);
-    }
-    setTimeout(fallbackMenu, 300);
+    // Let the native Settings.main().update() build the menu entry and bind
+    // the built-in hover:enter handler. Never append a data-static fallback.
+    try {
+      var main = Lampa.Settings.main();
+      if (main && typeof main.update === 'function') main.update();
+    } catch (e) { log('Native menu update error: ' + e.message); }
     setInterval(checkSchedule, 15000);
     window.addEventListener('focus', checkSchedule);
     document.addEventListener('visibilitychange', function () {
@@ -237,7 +208,7 @@
       version: VERSION,
       getConfig: settingsSnapshot,
       check: checkSchedule,
-      test: function () { notice('Lampa Alarm 0.2.0: тест пройден.'); }
+      test: function () { notice('Lampa Alarm 0.2.1: тест пройден.'); }
     };
     log('Initialized');
   }
