@@ -1,9 +1,9 @@
 (function () {
   'use strict';
 
-  // Lampa Alarm v0.5.0: one-shot startup test and manual TorrServer replay.
+  // Lampa Alarm v0.5.1: one-shot startup test and manual TorrServer replay.
   // Scheduled playback and Android system-volume control are still disabled.
-  var VERSION = '0.5.0';
+  var VERSION = '0.5.1';
   var COMPONENT = 'lampa_alarm';
   var PREFIX = 'la_';
   var ICON = '<svg viewBox="0 0 24 24" width="24" height="24" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v5l4 2" fill="none" stroke="currentColor" stroke-width="2"/></svg>';
@@ -18,8 +18,8 @@
     { id: 0, title: 'Воскресенье' }
   ];
 
-  if (window.__lampaAlarm050Loaded) return;
-  window.__lampaAlarm050Loaded = true;
+  if (window.__lampaAlarm051Loaded) return;
+  window.__lampaAlarm051Loaded = true;
 
   // Best-effort wake detection: this cannot identify the TV power-on reason.
   // Unknown/unobserved wake never triggers a wake-guarded alarm.
@@ -153,7 +153,7 @@
     try {
       var item = storedValue('torrent_bookmark', '');
       if (!item || typeof item !== 'object') return null;
-      if (!/^[0-9a-fA-F]{32,64}$/.test(String(item.hash || ''))) return null;
+      if (!/^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64}|[A-Za-z2-7]{32})$/.test(String(item.hash || ''))) return null;
       var index = Number(item.fileIndex);
       if (!isFinite(index) || Math.floor(index) !== index ||
           index < 0 || index > 100000) return null;
@@ -178,8 +178,143 @@
       bookmark.seriesId === series.id && bookmark.source === series.source);
   }
 
+
+  // Accept the standard v1 hex (40), v2 hex (64) and v1 Base32 (32)
+  // representations. The torrent/file identity is a local reference, not a URL.
+  function validTorrentHash(hash) {
+    return /^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64}|[A-Za-z2-7]{32})$/.test(String(hash || ''));
+  }
+
+  function parseTorrentStreamUrl(url) {
+    var result = { hash: '', fileIndex: null };
+    if (typeof url !== 'string' || url.length > 4096) return result;
+    try {
+      var link = /[?&]link=([^&#]+)/i.exec(url);
+      var gst = /\/gst\/([^/?#]+)\/master\.m3u8/i.exec(url);
+      var index = /[?&]index=([0-9]+)/i.exec(url);
+      if (link || gst) {
+        var part = (link || gst)[1];
+        var decoded = decodeURIComponent(part);
+        if (validTorrentHash(decoded)) result.hash = decoded;
+      }
+      if (index && /^[0-9]{1,6}$/.test(index[1])) {
+        var fileIndex = Number(index[1]);
+        if (fileIndex <= 100000) result.fileIndex = fileIndex;
+      }
+    } catch (e) { log('Could not parse stream identity: ' + e.message); }
+    return result;
+  }
+
+  function torrentIdentityFromData(data) {
+    var urlIdentity = parseTorrentStreamUrl(data && data.url);
+    if (!data || typeof data !== 'object') {
+      return { hash: '', fileIndex: null, reason: 'нет данных файла' };
+    }
+
+    var directHash = String(data.torrent_hash || '');
+    var hash = validTorrentHash(directHash) ? directHash : urlIdentity.hash;
+
+    var rawIndex = data.id;
+    if (rawIndex === null || typeof rawIndex === 'undefined' || rawIndex === '') {
+      rawIndex = data.file_index;
+    }
+    if (rawIndex === null || typeof rawIndex === 'undefined' || rawIndex === '') {
+      rawIndex = data.fileIndex;
+    }
+    if (rawIndex === null || typeof rawIndex === 'undefined' || rawIndex === '') {
+      rawIndex = urlIdentity.fileIndex;
+    }
+    var fileIndex = null;
+    if (rawIndex !== null && typeof rawIndex !== 'undefined' && rawIndex !== '' &&
+        /^[0-9]{1,6}$/.test(String(rawIndex))) {
+      var value = Number(rawIndex);
+      if (value <= 100000) fileIndex = value;
+    }
+    if (!hash) return { hash: '', fileIndex: fileIndex, reason: 'не получен корректный хэш торрента' };
+    if (fileIndex === null) return { hash: hash, fileIndex: null, reason: 'не получен индекс видеофайла' };
+    return { hash: hash, fileIndex: fileIndex, reason: 'ready' };
+  }
+
+  function saveTorrentIdentity(data, selected, observation) {
+    if (!selected || !data || !isSameCard(data.card || data.movie, selected)) {
+      return false;
+    }
+    var identity = torrentIdentityFromData(data);
+    if (identity.reason !== 'ready') {
+      save('torrent_save_status', identity.reason);
+      log('Torrent identity not saved: ' + identity.reason);
+      return false;
+    }
+    var tl = data.timeline && typeof data.timeline === 'object' ? data.timeline : {};
+    var bookmark = {
+      seriesId: selected.id,
+      source: selected.source,
+      hash: identity.hash,
+      fileIndex: identity.fileIndex,
+      season: observation && observation.season ||
+        episodeNumber(tl.season || data.season),
+      episode: observation && observation.episode ||
+        episodeNumber(tl.episode || data.episode),
+      episodeTitle: String(observation && observation.episodeTitle ||
+        data.title || '').slice(0, 200),
+      savedAt: new Date().toISOString()
+    };
+    save('torrent_bookmark', bookmark);
+    save('torrent_save_status', 'ready');
+    log('Torrent file identity saved: fileIndex=' + identity.fileIndex);
+    return true;
+  }
+
+  function onTorrentFileEvent(event) {
+    if (!event || event.type !== 'onenter' || !event.element) return;
+    try {
+      var selected = selectedSeries();
+      var file = event.element;
+      var fromList = event.params && event.params.movie;
+      var card = file.card || fromList;
+      if (!selected || !isSameCard(card, selected)) return;
+      var metadata = {
+        season: episodeNumber(file.season),
+        episode: episodeNumber(file.episode),
+        episodeTitle: String(file.title || '').slice(0, 200)
+      };
+      // The Lampa torrent-file event carries a chosen file even when an
+      // external Android player doesn't provide full Player metadata.
+      saveTorrentIdentity({
+        torrent_hash: file.torrent_hash,
+        id: file.id,
+        url: file.url,
+        card: card,
+        title: file.title,
+        season: file.season,
+        episode: file.episode,
+        timeline: file.timeline
+      }, selected, metadata);
+    } catch (e) { log('Torrent file selection error: ' + e.message); }
+  }
+
+  function bookmarkDiagnosticMessage() {
+    var bookmark = torrentBookmark();
+    var selected = selectedSeries();
+    if (isBookmarkCurrent(bookmark, selected)) {
+      return 'TorrServer: файл для повтора сохранён и готов к проверке.';
+    }
+    if (bookmark && selected && !isBookmarkCurrent(bookmark, selected)) {
+      return 'TorrServer: сохранённый файл относится к другому сериалу.';
+    }
+    var reason = String(storedValue('torrent_save_status', '') || '');
+    if (reason && reason !== 'ready')
+      return 'TorrServer: файл не сохранён — ' + reason + '. Запусти серию снова.';
+    var last = lastPlayback();
+    if (last && last.sourceType === 'torrent')
+      return 'Просмотр TorrServer найден, но хэш/индекс не были сохранены. ' +
+        'Снова открой серию через TorrServer в этой версии плагина.';
+    return 'Файл TorrServer не сохранён. Выбери сериал и запусти серию через TorrServer.';
+  }
+
   function clearSavedReplay() {
     save('torrent_bookmark', '');
+    save('torrent_save_status', '');
     save('last_playback', '');
     sessionOnline = null;
     currentPlayback = null;
@@ -359,25 +494,7 @@
       currentPlayback = series;
       save('last_playback', series);
       if (series.sourceType === 'torrent') {
-        var hash = String(data.torrent_hash || '');
-        var id = data.id;
-        if (/^[0-9a-fA-F]{32,64}$/.test(hash) &&
-            id !== null && typeof id !== 'undefined' && id !== '' &&
-            isFinite(Number(id)) && Number(id) >= 0 &&
-            Number(id) <= 100000 && Math.floor(Number(id)) === Number(id)) {
-          save('torrent_bookmark', {
-            seriesId: selected.id,
-            source: selected.source,
-            hash: hash,
-            fileIndex: Number(id),
-            season: series.season,
-            episode: series.episode,
-            episodeTitle: series.episodeTitle,
-            savedAt: new Date().toISOString()
-          });
-        } else {
-          log('TorrServer file index or torrent hash was not available');
-        }
+        saveTorrentIdentity(data, selected, series);
         sessionOnline = null;
       } else if (mode === 'internal' && typeof data.url === 'string' &&
                  /^https?:\/\//i.test(data.url)) {
@@ -495,7 +612,7 @@
     var selected = selectedSeries();
     var bookmark = torrentBookmark();
     if (!isBookmarkCurrent(bookmark, selected)) {
-      notice('Нет сохранённой серии TorrServer. Запусти её вручную один раз.');
+      notice(bookmarkDiagnosticMessage());
       return false;
     }
     if (!Lampa.Torserver || typeof Lampa.Torserver.files !== 'function' ||
@@ -629,7 +746,7 @@
     }
     if (!canLaunchTorrent()) {
       save('startup_test_enabled', false);
-      notice('Для теста после включения сначала открой одну серию через TorrServer');
+      notice(bookmarkDiagnosticMessage());
       return;
     }
     save('startup_test_enabled', true);
@@ -648,7 +765,7 @@
     if (!state) {
       notice(isBookmarkCurrent(book, series) ?
         'Тест отключён. Сохранённая серия TorrServer готова.' :
-        'Тест отключён. Для запуска нужна просмотренная серия TorrServer.');
+        bookmarkDiagnosticMessage());
     } else {
       notice('Тест ожидает следующего запуска или пробуждения Lampa.');
     }
@@ -705,7 +822,8 @@
       torrentBookmark: torrentBookmark() ?
         { season: torrentBookmark().season, episode: torrentBookmark().episode,
           fileIndex: torrentBookmark().fileIndex, savedAt: torrentBookmark().savedAt } : null,
-      startupTestEnabled: enabled('startup_test_enabled', false)
+      startupTestEnabled: enabled('startup_test_enabled', false),
+      torrentBookmarkStatus: bookmarkDiagnosticMessage()
     };
   }
   function checkSchedule() {
@@ -857,6 +975,9 @@
         '15': '15 минут', '20': '20 минут', '30': '30 минут' });
 
     addTitle('Проверка воспроизведения');
+    addParam('torrent_file_check', 'button', 'Проверить сохранение файла TorrServer',
+      'Покажет, сохранились ли хэш и индекс файла после выбора серии.', '', null,
+      function () { notice(bookmarkDiagnosticMessage()); });
     addParam('manual_torrent', 'button', 'Запустить сохранённую серию TorrServer',
       'Ручной тест по актуальной ссылке с TorrServer (требует ранее запущенного файла).',
       '', null, launchTorrentSeries);
@@ -873,7 +994,7 @@
     addParam('test', 'button', 'Проверить уведомление',
       'Покажет тестовое уведомление. Видео не запустится, громкость не изменится.', '', null,
       function () {
-        notice('Lampa Alarm 0.5.0: тест пройден, настройки доступны.');
+        notice('Lampa Alarm 0.5.1: тест пройден, настройки доступны.');
         log('Manual test performed');
       });
     addParam('status', 'button', 'Показать текущие настройки',
@@ -894,7 +1015,7 @@
       setupSettings();
     } catch (e) {
       log('Setup failed: ' + e.message);
-      notice('Lampa Alarm 0.5.0: ошибка регистрации настроек');
+      notice('Lampa Alarm 0.5.1: ошибка регистрации настроек');
     }
     // Let the native Settings.main().update() build the menu entry and bind
     // the built-in hover:enter handler. Never append a data-static fallback.
@@ -907,6 +1028,8 @@
     try {
       if (Lampa.Listener && typeof Lampa.Listener.follow === 'function')
         Lampa.Listener.follow('full', addSeriesButton);
+      if (Lampa.Listener && typeof Lampa.Listener.follow === 'function')
+        Lampa.Listener.follow('torrent_file', onTorrentFileEvent);
     } catch (e) { log('Card listener failed: ' + e.message); }
     try {
       if (Lampa.Player && Lampa.Player.listener &&
@@ -952,7 +1075,7 @@
         } : null;
       },
       check: checkSchedule,
-      test: function () { notice('Lampa Alarm 0.5.0: тест пройден.'); }
+      test: function () { notice('Lampa Alarm 0.5.1: тест пройден.'); }
     };
     log('Initialized');
   }
