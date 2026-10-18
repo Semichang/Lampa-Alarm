@@ -1,9 +1,9 @@
 (function () {
   'use strict';
 
-  // Lampa Alarm v0.7.0: one-shot startup test and manual TorrServer replay.
+  // Lampa Alarm v0.7.1: one-shot startup test and manual TorrServer replay.
   // Scheduled playback and Android system-volume control are still disabled.
-  var VERSION = '0.7.0';
+  var VERSION = '0.7.1';
   var COMPONENT = 'lampa_alarm';
   var PREFIX = 'la_';
   var ICON = '<svg viewBox="0 0 24 24" width="24" height="24" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v5l4 2" fill="none" stroke="currentColor" stroke-width="2"/></svg>';
@@ -18,8 +18,8 @@
     { id: 0, title: 'Воскресенье' }
   ];
 
-  if (window.__lampaAlarm070Loaded) return;
-  window.__lampaAlarm070Loaded = true;
+  if (window.__lampaAlarm071Loaded) return;
+  window.__lampaAlarm071Loaded = true;
 
   // Best-effort wake detection: this cannot identify the TV power-on reason.
   // Unknown/unobserved wake never triggers a wake-guarded alarm.
@@ -570,6 +570,8 @@
       var selectors=[
         '.online.selector.focus .online__title',
         '.online.focus .online__title',
+        '.online_modss.focus .online_modss__title',
+        '.online_modss--full.focus .online_modss__title',
         '.torrent-item.focus .online__title',
         '.selector.focus .online__title'
       ];
@@ -684,6 +686,7 @@
     var provider=component === 'online_mod' ? 'AT Anton Online Mod' :
       component === 'online' ? 'Lampa Online' :
       component === 'online_prestige' ? 'Lampa Online Prestige' :
+      component === 'modss_online' ? 'MODS’s' :
       component ? component : 'Онлайн-плагин не определён';
     var explicit=plainLabel(data && (data.balanser || data.balancer ||
       data.provider || data.provider_name || data.service),80);
@@ -1409,6 +1412,110 @@
   }
 
 
+
+  // A plugin listed in Lampa's catalog isn't necessarily installed,
+  // registered in the running WebView, or capable of resolving a stream.
+  function knownOnlineComponents() {
+    return [
+      {key:'online_mod',title:'AT Anton Online Mod',kind:'online'},
+      {key:'modss_online',title:'MODS’s',kind:'online'},
+      {key:'online',title:'Lampa Online',kind:'online'},
+      {key:'online_prestige',title:'Online Prestige',kind:'online'},
+      {key:'vod',title:'Online Stream (пример)',kind:'online'},
+      {key:'bwarc',title:'BWA (пример)',kind:'online'}
+    ];
+  }
+
+  function observedOnlineComponents() {
+    var items=safeStorageGet(PREFIX+'online_components_seen',[]);
+    if(!Array.isArray(items))return [];
+    return items.filter(function(x){
+      return x && typeof x==='object' &&
+        /^[a-z][a-z0-9_-]{0,50}$/i.test(x.key||'') &&
+        sourceComponentIsOnline(x.key);
+    }).slice(0,25);
+  }
+
+  function observeOnlineActivity(event){
+    if(!event || event.type!=='start'||!event.object)return;
+    var component=String(event.object.component||'');
+    if(!/^[a-z][a-z0-9_-]{0,50}$/i.test(component) ||
+       !sourceComponentIsOnline(component))return;
+    var items=observedOnlineComponents().filter(function(x){
+      return x.key!==component;
+    });
+    items.unshift({key:component,title:component,
+      lastOpen:new Date().toISOString()});
+    save('online_components_seen',items.slice(0,25));
+  }
+
+  function onlineComponentInventory(){
+    var entries=knownOnlineComponents();
+    observedOnlineComponents().forEach(function(x){
+      if(!entries.some(function(e){return e.key===x.key}))
+        entries.push({key:x.key,title:x.key,kind:'online'});
+    });
+    var history=playbackHistory();
+    history.forEach(function(x){
+      var component=String(x.providerComponent||'');
+      if(x.sourceType==='online' &&
+         /^[a-z][a-z0-9_-]{0,50}$/i.test(component) &&
+         sourceComponentIsOnline(component) &&
+         !entries.some(function(e){return e.key===component})){
+        entries.push({key:component,title:plainLabel(x.provider,80)||
+          component,kind:'online'});
+      }
+    });
+    var observed=observedOnlineComponents();
+    return entries.map(function(e){
+      var registered=false;
+      try{
+        registered=Boolean(Lampa.Component &&
+          typeof Lampa.Component.get==='function' &&
+          Lampa.Component.get(e.key));
+      }catch(error){}
+      var visited=observed.some(function(v){return v.key===e.key});
+      var inHistory=history.some(function(v){
+        return v.sourceType==='online' &&
+          v.providerComponent===e.key;
+      });
+      return {component:e.key,name:e.title,
+        registered:registered,visited:visited,seenInHistory:inHistory};
+    });
+  }
+
+  function showOnlineInventory(){
+    var entries=onlineComponentInventory();
+    if(Lampa.Select && typeof Lampa.Select.show==='function'){
+      try{
+        var controller=Lampa.Controller && Lampa.Controller.enabled ?
+          Lampa.Controller.enabled():null;
+        var back=controller && controller.name || 'settings_component';
+        Lampa.Select.show({
+          title:'Онлайн-компоненты Lampa',
+          items:entries.map(function(x){
+            return {
+              title:x.name,
+              subtitle:(x.registered?'Зарегистрирован':'Регистрация не подтверждена')+
+                (x.visited?' • открывался':'')+
+                (x.seenInHistory?' • есть история просмотра':'')+
+                ' • '+x.component
+            };
+          }),
+          onSelect:function(x){notice(x.title+': '+x.subtitle);},
+          onBack:function(){
+            if(Lampa.Controller && Lampa.Controller.toggle)
+              Lampa.Controller.toggle(back);
+          }
+        });
+        return;
+      }catch(e){log('Online inventory dialog failed: '+e.message);}
+    }
+    notice(entries.map(function(e){
+      return e.name+': '+(e.registered?'зарегистрирован':'не подтверждён');
+    }).join(' | '));
+  }
+
   // Online replay uses the installed plugin's OWN episode selection button.
   // It must not try to reuse saved stream URLs after restarting Lampa.
   function onlineReplayCandidate(){
@@ -1439,7 +1546,7 @@
 
   function onlineComponentSupported(component){
     if(!/^[a-z][a-z0-9_-]{0,50}$/i.test(component||''))return false;
-    if(component==='online_mod' ||
+    if(component==='online_mod' || component==='modss_online' ||
        component==='online' || component==='online_prestige')return true;
     // Other installed online providers may follow the same list conventions.
     // Only use a named component registered by Lampa, never an unknown one.
@@ -1574,20 +1681,28 @@
     var root=activity.activity && typeof activity.activity.render==='function' ?
       activity.activity.render() : null;
     if(!root || typeof root.find!=='function')return result;
-    var list=root.find('.online.selector');
+    // MODS’s (historical source) renders different episode cards.
+    // Unknown formats are not clicked automatically.
+    var isModss=job.route.component==='modss_online';
+    var list=root.find(isModss ?
+      '.online_modss.selector, .online_modss--full.selector' : '.online.selector');
+    if(isModss && (!list || !list.length))
+      list=root.find('.online_modss, .online_modss--full');
     if(!list || typeof list.each!=='function')return result;
     var count=0;
     list.each(function(index,element){
       if(count++>500)return;
       try{
         var item=$(element);
-        var titleNode=item.find('.online__title');
+        var titleNode=item.find(isModss ? '.online_modss__title' :
+          '.online__title');
         var title=titleNode && titleNode.length && titleNode.first ?
           titleNode.first().text() : item.text();
         var parsed=extractEpisodeFromTitle(title);
         if(parsed.season===job.route.season &&
            parsed.episode===job.route.episode){
-          var infoNode=item.find('.online__quality');
+          var infoNode=item.find(isModss ? '.online_modss__quality' :
+            '.online__quality');
           var info=infoNode && infoNode.length ? infoNode.text() : '';
           result.push({item:item,title:plainLabel(title,170),
             detail:plainLabel(info,180)});
@@ -2085,6 +2200,11 @@
       { '0': 'Сразу', '2': '2 минуты', '5': '5 минут', '10': '10 минут',
         '15': '15 минут', '20': '20 минут', '30': '30 минут' });
 
+    addTitle('Онлайн-плагины — диагностика');
+    addParam('online_components','button','Найти онлайн-компоненты',
+      'Показывает зарегистрированные Lampa онлайн-источники и те, '+
+      'которые уже открывались. Каталог и HTTP 200 не доказывают работу.',
+      '',null,showOnlineInventory);
     addTitle('Повтор онлайн-серии — тест');
     addParam('online_route_info','button','Сохранённый онлайн-маршрут',
       'Показывает плагин, балансер и последнюю серию без URL видео.',
@@ -2142,7 +2262,7 @@
     addParam('test', 'button', 'Проверить уведомление',
       'Покажет тестовое уведомление. Видео не запустится, громкость не изменится.', '', null,
       function () {
-        notice('Lampa Alarm 0.7.0: тест пройден, настройки доступны.');
+        notice('Lampa Alarm 0.7.1: тест пройден, настройки доступны.');
         log('Manual test performed');
       });
     addParam('status', 'button', 'Показать текущие настройки',
@@ -2163,7 +2283,7 @@
       setupSettings();
     } catch (e) {
       log('Setup failed: ' + e.message);
-      notice('Lampa Alarm 0.7.0: ошибка регистрации настроек');
+      notice('Lampa Alarm 0.7.1: ошибка регистрации настроек');
     }
     // Let the native Settings.main().update() build the menu entry and bind
     // the built-in hover:enter handler. Never append a data-static fallback.
@@ -2179,6 +2299,7 @@
       if (Lampa.Listener && typeof Lampa.Listener.follow==='function')
         Lampa.Listener.follow('activity', function(e){
           onOnlineActivityEvent(e);
+          observeOnlineActivity(e);
           if (!e || (e.type!=='start' && e.type!=='create')) return;
           var selected=selectedSeries();
           if (!selected) return;
@@ -2231,6 +2352,7 @@
       testTorrentPlayback: launchTorrentSeries,
       getTorrentLaunchStatus: launchReport,
       getOnlineReplayCandidate: onlineReplayCandidate,
+      listOnlineComponents: onlineComponentInventory,
       getOnlineLaunchStatus: onlineStatus,
       testOnlineRoute: function(){return startOnlineReplay(true)},
       openOnlineSource: function(){return startOnlineReplay(false)},
@@ -2248,7 +2370,7 @@
         } : null;
       },
       check: checkSchedule,
-      test: function () { notice('Lampa Alarm 0.7.0: тест пройден.'); }
+      test: function () { notice('Lampa Alarm 0.7.1: тест пройден.'); }
     };
     log('Initialized');
   }
