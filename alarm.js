@@ -1,9 +1,9 @@
 (function () {
   'use strict';
 
-  // Lampa Alarm v0.4.0: settings and schedule notification only.
+  // Lampa Alarm v0.5.0: settings and schedule notification only.
   // This version intentionally does not start videos or change Android volume.
-  var VERSION = '0.4.0';
+  var VERSION = '0.5.0';
   var COMPONENT = 'lampa_alarm';
   var PREFIX = 'la_';
   var ICON = '<svg viewBox="0 0 24 24" width="24" height="24" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v5l4 2" fill="none" stroke="currentColor" stroke-width="2"/></svg>';
@@ -18,8 +18,8 @@
     { id: 0, title: 'Воскресенье' }
   ];
 
-  if (window.__lampaAlarm040Loaded) return;
-  window.__lampaAlarm040Loaded = true;
+  if (window.__lampaAlarm050Loaded) return;
+  window.__lampaAlarm050Loaded = true;
 
   // Best-effort wake detection: this cannot identify the TV power-on reason.
   // Unknown/unobserved wake never triggers a wake-guarded alarm.
@@ -27,6 +27,12 @@
   var hiddenAt = null;
   var lastHeartbeatAt = Date.now();
   var lastInteractionAt = 0;
+  var startupSessionId = String(Date.now()) + '-' + String(Math.random()).slice(2);
+  var startupTestTriggered = false;
+  var launchInProgress = false;
+  var startupTimer = null;
+  var sessionOnline = null;
+  var ONLINE_TTL_MS = 120000;
 
   function markInteraction() { lastInteractionAt = Date.now(); }
 
@@ -50,6 +56,8 @@
     if (!document.hidden && gap >= wakeThresholdMs()) {
       rememberWake('пауза таймера', gap, now);
     }
+    if (!document.hidden && gap >= 30000)
+      tryArmedStartupTest('пауза таймера', gap);
     checkSchedule();
   }
 
@@ -60,11 +68,14 @@
       return;
     }
     if (hiddenAt !== null) {
-      rememberWake('возврат приложения', now - hiddenAt, now);
+      var dormant = now - hiddenAt;
+      rememberWake('возврат приложения', dormant, now);
       hiddenAt = null;
+      if (dormant >= 10000) tryArmedStartupTest('возврат приложения', dormant);
     } else {
       var gap = now - lastHeartbeatAt;
       if (gap >= wakeThresholdMs()) rememberWake('пауза таймера', gap, now);
+      if (gap >= 30000) tryArmedStartupTest('возобновление таймера', gap);
     }
     lastHeartbeatAt = now;
     checkSchedule();
@@ -133,7 +144,51 @@
     } catch (e) { log('Selected series error: ' + e.message); return null; }
   }
 
+  function storedValue(name, otherwise) {
+    try { return Lampa.Storage.get(PREFIX + name, otherwise); }
+    catch (e) { return otherwise; }
+  }
+
+  function torrentBookmark() {
+    try {
+      var item = storedValue('torrent_bookmark', '');
+      if (!item || typeof item !== 'object') return null;
+      if (!/^[0-9a-fA-F]{32,64}$/.test(String(item.hash || ''))) return null;
+      var index = Number(item.fileIndex);
+      if (!isFinite(index) || Math.floor(index) !== index ||
+          index < 0 || index > 100000) return null;
+      return {
+        seriesId: String(item.seriesId || ''),
+        source: String(item.source || ''),
+        hash: String(item.hash),
+        fileIndex: index,
+        season: episodeNumber(item.season),
+        episode: episodeNumber(item.episode),
+        episodeTitle: String(item.episodeTitle || '').slice(0, 200),
+        savedAt: String(item.savedAt || '')
+      };
+    } catch (e) {
+      log('Torrent bookmark error: ' + e.message);
+      return null;
+    }
+  }
+
+  function isBookmarkCurrent(bookmark, series) {
+    return Boolean(bookmark && series &&
+      bookmark.seriesId === series.id && bookmark.source === series.source);
+  }
+
+  function clearSavedReplay() {
+    save('torrent_bookmark', '');
+    save('last_playback', '');
+    sessionOnline = null;
+    currentPlayback = null;
+    save('startup_test_enabled', false);
+    save('startup_test_origin', '');
+  }
+
   function clearSelectedSeries() {
+    clearSavedReplay();
     save('selected_series', '');
     notice('Lampa Alarm: выбранный сериал сброшен');
   }
@@ -162,6 +217,10 @@
       notice('Будильник: не удалось определить сериал в карточке');
       return false;
     }
+    var previouslySelected = selectedSeries();
+    if (previouslySelected &&
+        (previouslySelected.id !== selected.id ||
+         previouslySelected.source !== selected.source)) clearSavedReplay();
     save('selected_series', selected);
     notice('Сериал для будильника: ' + selected.title);
     log('Series saved: ' + selected.source + ' / ' + selected.id);
@@ -299,6 +358,36 @@
 
       currentPlayback = series;
       save('last_playback', series);
+      if (series.sourceType === 'torrent') {
+        var hash = String(data.torrent_hash || '');
+        var id = data.id;
+        if (/^[0-9a-fA-F]{32,64}$/.test(hash) &&
+            id !== null && typeof id !== 'undefined' && id !== '' &&
+            isFinite(Number(id)) && Number(id) >= 0 &&
+            Number(id) <= 100000 && Math.floor(Number(id)) === Number(id)) {
+          save('torrent_bookmark', {
+            seriesId: selected.id,
+            source: selected.source,
+            hash: hash,
+            fileIndex: Number(id),
+            season: series.season,
+            episode: series.episode,
+            episodeTitle: series.episodeTitle,
+            savedAt: new Date().toISOString()
+          });
+        } else {
+          log('TorrServer file index or torrent hash was not available');
+        }
+        sessionOnline = null;
+      } else if (mode === 'internal' && typeof data.url === 'string' &&
+                 /^https?:\/\//i.test(data.url)) {
+        sessionOnline = {
+          seriesId: selected.id,
+          source: selected.source,
+          at: Date.now(),
+          data: data // memory only; never written to Storage or logs
+        };
+      }
       log('Captured ' + series.sourceType + ' playback, match=' + match +
           ', season=' + series.season + ', episode=' + series.episode);
       return series;
@@ -379,6 +468,217 @@
     notice('Будильник: история тестового воспроизведения очищена');
   }
 
+
+  function manualRunPlayer(data) {
+    if (!Lampa.Player || typeof Lampa.Player.play !== 'function')
+      throw Error('Lampa.Player.play is unavailable');
+    if (launchInProgress ||
+        (typeof Lampa.Player.opened === 'function' && Lampa.Player.opened()))
+      throw Error('Playback already running');
+    launchInProgress = true;
+    try {
+      if (Lampa.Controller && typeof Lampa.Controller.toggle === 'function')
+        Lampa.Controller.toggle('content');
+      Lampa.Player.play(data);
+      if (Lampa.Player.playlist && typeof Lampa.Player.playlist === 'function')
+        Lampa.Player.playlist([data]);
+    } finally {
+      setTimeout(function () { launchInProgress = false; }, 4000);
+    }
+  }
+
+  function canLaunchTorrent() {
+    return isBookmarkCurrent(torrentBookmark(), selectedSeries());
+  }
+
+  function launchTorrentSeries() {
+    var selected = selectedSeries();
+    var bookmark = torrentBookmark();
+    if (!isBookmarkCurrent(bookmark, selected)) {
+      notice('Нет сохранённой серии TorrServer. Запусти её вручную один раз.');
+      return false;
+    }
+    if (!Lampa.Torserver || typeof Lampa.Torserver.files !== 'function' ||
+        typeof Lampa.Torserver.stream !== 'function' ||
+        !Lampa.Player || typeof Lampa.Player.play !== 'function') {
+      notice('На этом устройстве недоступен нужный API TorrServer');
+      return false;
+    }
+    if (launchInProgress ||
+        (Lampa.Player.opened && Lampa.Player.opened())) {
+      notice('Плеер уже запущен');
+      return false;
+    }
+
+    launchInProgress = true;
+    notice('Будильник: загружаю сохранённую серию TorrServer...');
+    var finished = false;
+    var timeoutId;
+    function finish(message) {
+      if (finished) return;
+      finished = true;
+      launchInProgress = false;
+      if (typeof clearTimeout === 'function') clearTimeout(timeoutId);
+      if (message) {
+        notice(message);
+        log(message);
+      }
+    }
+    try {
+      timeoutId = setTimeout(function () {
+        finish('TorrServer не ответил за 15 секунд');
+      }, 15000);
+      Lampa.Torserver.files(bookmark.hash, function (response) {
+        if (finished) return;
+        try {
+          var files = response && response.file_stats;
+          if (!Array.isArray(files)) return finish('TorrServer не вернул файлы');
+          var file = null;
+          for (var i = 0; i < files.length; i++) {
+            if (Number(files[i].id) === bookmark.fileIndex) {
+              file = files[i]; break;
+            }
+          }
+          if (!file || typeof file.path !== 'string' || !file.path)
+            return finish('Сохранённая серия не найдена на TorrServer');
+          var url = Lampa.Torserver.stream(file.path, bookmark.hash, bookmark.fileIndex);
+          if (typeof url !== 'string' || !/^https?:\/\//i.test(url))
+            return finish('TorrServer не вернул действительную ссылку');
+
+          var card = {
+            id: /^\d+$/.test(selected.id) ? Number(selected.id) : selected.id,
+            source: selected.source,
+            name: selected.title,
+            title: selected.title,
+            original_name: selected.originalTitle || selected.title,
+            original_title: selected.originalTitle || selected.title
+          };
+          var data = {
+            url: url,
+            title: bookmark.episodeTitle ||
+              file.path.split(/[\\/]/).pop(),
+            card: card,
+            movie: card,
+            torrent_hash: bookmark.hash,
+            id: bookmark.fileIndex,
+            season: bookmark.season,
+            episode: bookmark.episode
+          };
+          if (bookmark.season && bookmark.episode &&
+              Lampa.Timeline && Lampa.Timeline.link &&
+              Lampa.Timeline.view && Lampa.Utils && Lampa.Utils.hash) {
+            try {
+              var meta = Lampa.Timeline.link(card, bookmark.season, bookmark.episode);
+              var h = Lampa.Utils.hash([
+                bookmark.season,
+                bookmark.season > 10 ? ':' : '',
+                bookmark.episode,
+                card.original_name
+              ].join(''));
+              data.timeline = Lampa.Timeline.view(h, meta);
+            } catch (e) { log('Timeline metadata error: ' + e.message); }
+          }
+          launchInProgress = false;
+          manualRunPlayer(data);
+          finish();
+        } catch (e) {
+          finish('Ошибка запуска серии TorrServer');
+          log('Playback error: ' + e.message);
+        }
+      }, function () { finish('Ошибка запроса файлов TorrServer'); });
+      return true;
+    } catch (e) {
+      finish('Не удалось обратиться к TorrServer');
+      log('TorrServer call failed: ' + e.message);
+      return false;
+    }
+  }
+
+  function launchOnlineSession() {
+    var series = selectedSeries();
+    if (!sessionOnline || !series ||
+        sessionOnline.seriesId !== series.id ||
+        sessionOnline.source !== series.source ||
+        Date.now() - sessionOnline.at < 0 ||
+        Date.now() - sessionOnline.at > ONLINE_TTL_MS) {
+      notice('Онлайн: нет свежей серии в памяти. Требуется новая ссылка от плагина.');
+      return false;
+    }
+    try {
+      var data = {};
+      var original = sessionOnline.data;
+      for (var k in original) {
+        if (Object.prototype.hasOwnProperty.call(original, k))
+          data[k] = original[k];
+      }
+      manualRunPlayer(data);
+      return true;
+    } catch (e) {
+      log('Online session replay failed: ' + e.message);
+      notice('Онлайн-серию не удалось повторить');
+      return false;
+    }
+  }
+
+  function armOneShotTest(value) {
+    if (!(value === true || String(value) === 'true')) {
+      save('startup_test_enabled', false);
+      save('startup_test_origin', '');
+      notice('Тест после запуска отменён');
+      return;
+    }
+    if (!canLaunchTorrent()) {
+      save('startup_test_enabled', false);
+      notice('Для теста после включения сначала открой одну серию через TorrServer');
+      return;
+    }
+    save('startup_test_enabled', true);
+    save('startup_test_origin', startupSessionId);
+    save('startup_test_series', selectedSeries().source + ':' + selectedSeries().id);
+    save('startup_test_armed_at', Date.now());
+    startupTestTriggered = false;
+    notice('Тест подготовлен. Выключи TV, подожди 30 секунд и включи обратно.');
+    log('One-shot startup test armed');
+  }
+
+  function testStatus() {
+    var state = enabled('startup_test_enabled', false);
+    var book = torrentBookmark();
+    var series = selectedSeries();
+    if (!state) {
+      notice(isBookmarkCurrent(book, series) ?
+        'Тест отключён. Сохранённая серия TorrServer готова.' :
+        'Тест отключён. Для запуска нужна просмотренная серия TorrServer.');
+    } else {
+      notice('Тест ожидает следующего запуска или пробуждения Lampa.');
+    }
+  }
+
+  function tryArmedStartupTest(reason, inactiveMs) {
+    if (startupTestTriggered || !enabled('startup_test_enabled', false))
+      return false;
+    if (reason === 'новый запуск' &&
+        storedValue('startup_test_origin', '') === startupSessionId)
+      return false; // Never run immediately when the user checks the toggle.
+    if (reason !== 'новый запуск' && inactiveMs < 10000)
+      return false;
+
+    startupTestTriggered = true;
+    save('startup_test_enabled', false); // One-shot, consume before attempting.
+    save('startup_test_origin', '');
+
+    var selected = selectedSeries();
+    if (!selected ||
+        storedValue('startup_test_series', '') !==
+        (selected.source + ':' + selected.id)) {
+      notice('Тест отменён: выбранный сериал изменился');
+      return true;
+    }
+    notice('Будильник: пробую запустить серию после ' + reason);
+    setTimeout(function () { launchTorrentSeries(); }, 2500);
+    return true;
+  }
+
   function settingsSnapshot() {
     var dayValues = [];
     for (var i = 0; i < 7; i++) {
@@ -401,7 +701,11 @@
       wakeWindowMinutes: Number(read('wake_window', '3')),
       lastWakeInfo: String(read('last_wake_info', 'не обнаружено')),
       selectedSeries: selectedSeries(),
-      lastPlayback: lastPlayback()
+      lastPlayback: lastPlayback(),
+      torrentBookmark: torrentBookmark() ?
+        { season: torrentBookmark().season, episode: torrentBookmark().episode,
+          fileIndex: torrentBookmark().fileIndex, savedAt: torrentBookmark().savedAt } : null,
+      startupTestEnabled: enabled('startup_test_enabled', false)
     };
   }
   function checkSchedule() {
@@ -552,11 +856,24 @@
       { '0': 'Сразу', '2': '2 минуты', '5': '5 минут', '10': '10 минут',
         '15': '15 минут', '20': '20 минут', '30': '30 минут' });
 
+    addTitle('Проверка воспроизведения');
+    addParam('manual_torrent', 'button', 'Запустить сохранённую серию TorrServer',
+      'Ручной тест по актуальной ссылке с TorrServer (требует ранее запущенного файла).',
+      '', null, launchTorrentSeries);
+    addParam('manual_online', 'button', 'Повторить недавнюю онлайн-серию',
+      'Только в этой сессии Lampa и в течение двух минут после запуска видео.',
+      '', null, launchOnlineSession);
+    addParam('startup_test_enabled', 'trigger', 'Тест при следующем включении TV',
+      'Однократно запустить сохранённую серию TorrServer при следующем запуске ' +
+      'или возврате Lampa из сна. Расписание не используется.', false, null, armOneShotTest);
+    addParam('startup_test_status', 'button', 'Состояние тестового запуска',
+      'Проверить, подготовлен ли следующий запуск.', '', null, testStatus);
+
     addTitle('Проверка');
     addParam('test', 'button', 'Проверить уведомление',
       'Покажет тестовое уведомление. Видео не запустится, громкость не изменится.', '', null,
       function () {
-        notice('Lampa Alarm 0.4.0: тест пройден, настройки доступны.');
+        notice('Lampa Alarm 0.5.0: тест пройден, настройки доступны.');
         log('Manual test performed');
       });
     addParam('status', 'button', 'Показать текущие настройки',
@@ -577,7 +894,7 @@
       setupSettings();
     } catch (e) {
       log('Setup failed: ' + e.message);
-      notice('Lampa Alarm 0.4.0: ошибка регистрации настроек');
+      notice('Lampa Alarm 0.5.0: ошибка регистрации настроек');
     }
     // Let the native Settings.main().update() build the menu entry and bind
     // the built-in hover:enter handler. Never append a data-static fallback.
@@ -602,6 +919,11 @@
       }
     } catch (e) { log('Player subscription error: ' + e.message); }
     setInterval(checkHeartbeat, 15000);
+    // A cold WebView startup is different from an already running app.
+    // A suspended WebView is handled by visibility/focus or a long timer gap.
+    startupTimer = setTimeout(function () {
+      tryArmedStartupTest('новый запуск', 0);
+    }, 4500);
     window.addEventListener('focus', visibilityChanged);
     document.addEventListener('visibilitychange', visibilityChanged);
     document.addEventListener('keydown', markInteraction, false);
@@ -613,6 +935,13 @@
       getConfig: settingsSnapshot,
       getSelectedSeries: selectedSeries,
       getLastPlayback: lastPlayback,
+      getTestStatus: function () {
+        return { armed: enabled('startup_test_enabled', false),
+          hasTorrentBookmark: canLaunchTorrent() };
+      },
+      testTorrentPlayback: launchTorrentSeries,
+      testOnlinePlayback: launchOnlineSession,
+      armStartupTest: armOneShotTest,
       selectSeries: chooseSeries,
       clearSeries: clearSelectedSeries,
       getWakeState: function () {
@@ -623,7 +952,7 @@
         } : null;
       },
       check: checkSchedule,
-      test: function () { notice('Lampa Alarm 0.4.0: тест пройден.'); }
+      test: function () { notice('Lampa Alarm 0.5.0: тест пройден.'); }
     };
     log('Initialized');
   }
