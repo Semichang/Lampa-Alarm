@@ -24,6 +24,8 @@ param('rampMinutes','input',undefined,'Нарастание, мин','Систе
 }catch(e){console.error('[Lampa Alarm] Settings error',e)}
 }
 window.LampaAlarm={getConfig:()=>({...cfg}),set:p=>{if(!p||typeof p!=='object')return;const n={...cfg,...p};if(!/^([01]\d|2[0-3]):[0-5]\d$/.test(n.time))throw Error('Invalid time');if(!Array.isArray(n.days)||n.days.some(x=>!Number.isInteger(x)||x<0||x>6))throw Error('Invalid days');cfg=n;save()},test:()=>note('Lampa Alarm: тест. Воспроизведение пока не реализовано.'),check};
-function boot(){addSettings();check();setInterval(check,15000);document.addEventListener('visibilitychange',()=>{if(!document.hidden)check()});window.addEventListener('focus',check);console.log('[Lampa Alarm] v0.1.0 loaded')}
-if(window.Lampa?.SettingsApi)boot();else{let n=0;const timer=setInterval(()=>{if(window.Lampa?.SettingsApi){clearInterval(timer);boot()}else if(++n>60){clearInterval(timer);console.warn('[Lampa Alarm] Lampa API unavailable')}},500)}
+function boot(){addSettings();check();setInterval(check,15000);document.addEventListener('visibilitychange',()=>{if(!document.hidden)check()});window.addEventListener('focus',check);note('Lampa Alarm 0.1.1: плагин запущен');console.log('[Lampa Alarm] v0.1.1 loaded')}
+let started=false;function ready(){if(started||!window.Lampa?.SettingsApi||!window.appready)return;started=true;boot()}
+if(window.Lampa?.Listener?.follow){Lampa.Listener.follow('app',e=>{if(e.type==='ready')ready()})}
+let tries=0;const timer=setInterval(()=>{ready();if(started||++tries>120){clearInterval(timer);if(!started)console.warn('[Lampa Alarm] init timeout')}},500);ready();
 })();
