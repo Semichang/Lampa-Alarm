@@ -1,8 +1,8 @@
 (function () {
   'use strict';
 
-  // Lampa Alarm v0.5.0: settings and schedule notification only.
-  // This version intentionally does not start videos or change Android volume.
+  // Lampa Alarm v0.5.0: one-shot startup test and manual TorrServer replay.
+  // Scheduled playback and Android system-volume control are still disabled.
   var VERSION = '0.5.0';
   var COMPONENT = 'lampa_alarm';
   var PREFIX = 'la_';
