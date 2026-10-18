@@ -1621,6 +1621,16 @@
           'Найдено несколько вариантов серии; выбери нужную озвучку вручную');
         return;
       }
+      // A single matching episode can still have a different voice from the
+      // saved choice if filters changed. Never auto-play a visibly mismatched dub.
+      if(job.route.voice && chosen.detail &&
+         /(?:\/|озвуч|перевод|voice|dub)/i.test(chosen.detail) &&
+         chosen.detail.toLocaleLowerCase().indexOf(
+           job.route.voice.toLocaleLowerCase())<0){
+        onlineFinish(job,'manual',
+          'Озвучка отличается от сохранённой; проверь выбор вручную');
+        return;
+      }
       if(!chosen.item || typeof chosen.item.trigger!=='function'){
         onlineFinish(job,'manual',
           'Не удалось нажать на строку серии; выбери её вручную');
