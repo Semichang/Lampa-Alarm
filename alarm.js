@@ -565,6 +565,19 @@
         typeof activity.activity.render==='function' ?
         activity.activity.render() : null;
       if (!view || typeof view.find!=='function') return '';
+      // MODS’s displays S1:E1 on the thumbnail, not necessarily in
+      // .online_modss__title. Preserve the exact badge when capturing
+      // manually opened episodes as well as automatic replay.
+      if(activity && activity.component==='modss_online'){
+        var focused=view.find('.online_modss.focus, .online_modss--full.focus');
+        if(focused && focused.length){
+          var node=typeof focused.first==='function' ? focused.first():focused;
+          var episode=inspectEpisodeRow(node,true);
+          if(episode.season && episode.episode)
+            return 'S'+episode.season+'E'+episode.episode+
+              ' '+plainLabel(episode.title,130);
+        }
+      }
       // Read only a currently focused episode row of the active media screen.
       // No script URL, cookie, or network response is captured.
       var selectors=[
