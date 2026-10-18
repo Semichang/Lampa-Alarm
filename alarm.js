@@ -1,9 +1,9 @@
 (function () {
   'use strict';
 
-  // Lampa Alarm v0.7.1: one-shot startup test and manual TorrServer replay.
+  // Lampa Alarm v0.7.2: one-shot startup test and manual TorrServer replay.
   // Scheduled playback and Android system-volume control are still disabled.
-  var VERSION = '0.7.1';
+  var VERSION = '0.7.2';
   var COMPONENT = 'lampa_alarm';
   var PREFIX = 'la_';
   var ICON = '<svg viewBox="0 0 24 24" width="24" height="24" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v5l4 2" fill="none" stroke="currentColor" stroke-width="2"/></svg>';
@@ -18,8 +18,8 @@
     { id: 0, title: 'Воскресенье' }
   ];
 
-  if (window.__lampaAlarm071Loaded) return;
-  window.__lampaAlarm071Loaded = true;
+  if (window.__lampaAlarm072Loaded) return;
+  window.__lampaAlarm072Loaded = true;
 
   // Best-effort wake detection: this cannot identify the TV power-on reason.
   // Unknown/unobserved wake never triggers a wake-guarded alarm.
@@ -1676,39 +1676,175 @@
     onlineTimer(job,function(){onlineFindEpisodeRow(job)},800);
   }
 
+
+  // MODS's displays "S1:E1" as a badge on the thumbnail while the
+  // episode name (e.g., "Требуется помощник") is a separate title.
+  // Only parse metadata from within one episode row, never neighboring rows.
+  function episodeRowText(item, selector) {
+    try {
+      var child=item.find(selector);
+      if(child && child.length && typeof child.text==='function')
+        return plainLabel(child.text(),240);
+      if(child && child.length && typeof child.first==='function' &&
+         typeof child.first().text==='function')
+        return plainLabel(child.first().text(),240);
+    }catch(e){}
+    return '';
+  }
+
+  function safeRowAttribute(item,key) {
+    try {
+      if(item && typeof item.attr==='function'){
+        var val=item.attr(key);
+        return typeof val==='string' && val.length<=140 ? val : '';
+      }
+    }catch(e){}
+    return '';
+  }
+
+  function inspectEpisodeRow(item, isModss) {
+    var title=episodeRowText(item,isModss?
+      '.online_modss__title':'.online__title');
+    var detail=episodeRowText(item,isModss?
+      '.online_modss__quality':'.online__quality');
+    var dataSeason=null, dataEpisode=null;
+    var pairs=[
+      ['data-season','data-episode'],
+      ['data-season-number','data-episode-number'],
+      ['data-s','data-e']
+    ];
+    // jQuery data() may expose an episode object added by a third-party plugin.
+    try{
+      var node=item && item.length && item[0] || null;
+      for(var j=0;j<pairs.length;j++){
+        var season=safeRowAttribute(item,pairs[j][0]);
+        var episode=safeRowAttribute(item,pairs[j][1]);
+        if(node && node.getAttribute) {
+          season=season||node.getAttribute(pairs[j][0]);
+          episode=episode||node.getAttribute(pairs[j][1]);
+        }
+        if(numberOrNull(season)&&numberOrNull(episode)){
+          dataSeason=numberOrNull(season);
+          dataEpisode=numberOrNull(episode);
+          break;
+        }
+      }
+      if(!dataSeason && node && node.dataset){
+        dataSeason=numberOrNull(node.dataset.season || node.dataset.seasonNumber);
+        dataEpisode=numberOrNull(node.dataset.episode || node.dataset.episodeNumber);
+      }
+      if((!dataSeason||!dataEpisode)&&item && typeof item.data==='function'){
+        dataSeason=dataSeason||numberOrNull(item.data('season'));
+        dataEpisode=dataEpisode||numberOrNull(item.data('episode'));
+      }
+    }catch(e){log('Online episode attributes unavailable: '+e.message);}
+    if(dataSeason && dataEpisode)
+      return {title:title,detail:detail,season:dataSeason,
+        episode:dataEpisode,method:'атрибуты карточки'};
+
+    // Prefer the thumbnail region: the badge S1:E1 often lives here.
+    var sources=isModss?[
+      ['.online_modss__img','метка на постере'],
+      ['.online_modss__img .online_modss__season','номер на постере'],
+      ['.online_modss__img .online_modss__episode','номер на постере'],
+      ['.online_modss__img [data-episode]','атрибут миниатюры'],
+      ['.online_modss__badge','бейдж'],
+      ['.online_modss__mark','метка'],
+      ['.online_modss__info','данные карточки'],
+      ['.online_modss__title','название'],
+      ['.online_modss__head','верхняя строка'],
+      ['.online_modss__body','описание']
+    ]:[
+      ['.online__title','название'],
+      ['.online__body','описание']
+    ];
+    for(var i=0;i<sources.length;i++){
+      var label=episodeRowText(item,sources[i][0]);
+      var ep=extractEpisodeFromTitle(label);
+      if(ep.season && ep.episode)
+        return {title:title,detail:detail,season:ep.season,
+          episode:ep.episode,method:sources[i][1]};
+    }
+    // Reading the whole row is important when the title contains only the
+    // episode name, but a sibling contains the season/episode badge.
+    var text='';
+    try{if(item && typeof item.text==='function')text=plainLabel(item.text(),480)}catch(e){}
+    var parsed=extractEpisodeFromTitle(text);
+    if(parsed.season && parsed.episode)
+      return {title:title,detail:detail,season:parsed.season,
+        episode:parsed.episode,method:'полный текст строки'};
+
+    // Some Lampa themes put the number in a tooltip/ARIA label.
+    var attrNames=['title','aria-label','data-label','data-title'];
+    for(var k=0;k<attrNames.length;k++){
+      var attr=safeRowAttribute(item,attrNames[k]);
+      var fromAttr=extractEpisodeFromTitle(attr);
+      if(fromAttr.season && fromAttr.episode)
+        return {title:title,detail:detail,season:fromAttr.season,
+          episode:fromAttr.episode,method:'подпись элемента'};
+    }
+    var sample=plainLabel(text||title,140);
+    return {title:title,detail:detail,season:null,episode:null,
+      method:'неизвестен',sample:sample};
+  }
+
+  function onlineRowDiagnostics() {
+    var report=storedValue('online_rows_diag',null);
+    return report && typeof report==='object' ? report : null;
+  }
+
+  function onlineRowDiagnosticsText() {
+    var data=onlineRowDiagnostics();
+    if(!data)return 'Нет данных о строках онлайн-парсера. Запусти тест выбора серии.';
+    return plainLabel(data.component,40)+
+      ': строк '+data.total+
+      ', распознано номеров '+data.numbered+
+      ', совпадений '+data.matched+
+      (data.samples && data.samples.length ?
+        '. Примеры: '+data.samples.join(' | ') : '');
+  }
+
   function findEpisodeCandidates(job,activity){
     var result=[];
     var root=activity.activity && typeof activity.activity.render==='function' ?
       activity.activity.render() : null;
     if(!root || typeof root.find!=='function')return result;
-    // MODS’s (historical source) renders different episode cards.
-    // Unknown formats are not clicked automatically.
     var isModss=job.route.component==='modss_online';
     var list=root.find(isModss ?
       '.online_modss.selector, .online_modss--full.selector' : '.online.selector');
     if(isModss && (!list || !list.length))
       list=root.find('.online_modss, .online_modss--full');
     if(!list || typeof list.each!=='function')return result;
-    var count=0;
+    var count=0,parsedCount=0,examples=[],sampled=0;
     list.each(function(index,element){
-      if(count++>500)return;
+      if(count++>=500)return;
       try{
         var item=$(element);
-        var titleNode=item.find(isModss ? '.online_modss__title' :
-          '.online__title');
-        var title=titleNode && titleNode.length && titleNode.first ?
-          titleNode.first().text() : item.text();
-        var parsed=extractEpisodeFromTitle(title);
-        if(parsed.season===job.route.season &&
-           parsed.episode===job.route.episode){
-          var infoNode=item.find(isModss ? '.online_modss__quality' :
-            '.online__quality');
-          var info=infoNode && infoNode.length ? infoNode.text() : '';
-          result.push({item:item,title:plainLabel(title,170),
-            detail:plainLabel(info,180)});
+        var row=inspectEpisodeRow(item,isModss);
+        if(row.season && row.episode)parsedCount++;
+        if(examples.length<4)examples.push(
+          row.season && row.episode ?
+            'S'+row.season+'E'+row.episode+' ['+row.method+']':
+            (plainLabel(row.title||row.sample,45)||'без названия')+
+            ' [номер не найден]');
+        if(row.season===job.route.season &&
+           row.episode===job.route.episode){
+          result.push({item:item,title:plainLabel(row.title,170),
+            detail:plainLabel(row.detail,180),method:row.method});
         }
       }catch(e){log('Online row read error: '+e.message);}
     });
+    job.rowCount=count;
+    job.rowParsed=parsedCount;
+    job.rowMatches=result.length;
+    if(Date.now()-(job.lastRowReport||0)>4500 || job.lastRowReport===0){
+      job.lastRowReport=Date.now();
+      save('online_rows_diag',{
+        component:job.route.component,
+        total:count,numbered:parsedCount,matched:result.length,
+        samples:examples,at:new Date().toISOString()
+      });
+    }
     return result;
   }
 
@@ -1763,6 +1899,18 @@
           'Не удалось запустить строку плагина. Выбери серию вручную');
       }
       return;
+    }
+    // State is updated periodically, without spamming notifications.
+    if(Date.now()-(job.lastProgressMessage||0)>=5000){
+      job.lastProgressMessage=Date.now();
+      if(job.rowCount){
+        onlineRecordState(job,'waiting_rows',
+          'В списке '+job.rowCount+' строк, прочитано номеров '+
+          job.rowParsed+'. Ищу S'+job.route.season+'E'+job.route.episode);
+      }else{
+        onlineRecordState(job,'waiting_rows',
+          'Список эпизодов пока загружается');
+      }
     }
     onlineTimer(job,function(){onlineFindEpisodeRow(job)},1400);
   }
@@ -2226,6 +2374,9 @@
     addParam('online_launch_cancel','button','Отменить онлайн-тест',
       'Прекратить автоматический поиск серии, оставив экран открытым.',
       '',null,cancelOnlineRoute);
+    addParam('online_rows_diag','button','Диагностика списка серий',
+      'Показывает сколько строк и номеров серии удалось прочитать у плагина.',
+      '',null,function(){notice(onlineRowDiagnosticsText())});
 
     addTitle('Подготовка TorrServer');
     addParam('torrent_wait_seconds','select','Максимальное ожидание видео',
@@ -2262,7 +2413,7 @@
     addParam('test', 'button', 'Проверить уведомление',
       'Покажет тестовое уведомление. Видео не запустится, громкость не изменится.', '', null,
       function () {
-        notice('Lampa Alarm 0.7.1: тест пройден, настройки доступны.');
+        notice('Lampa Alarm 0.7.2: тест пройден, настройки доступны.');
         log('Manual test performed');
       });
     addParam('status', 'button', 'Показать текущие настройки',
@@ -2283,7 +2434,7 @@
       setupSettings();
     } catch (e) {
       log('Setup failed: ' + e.message);
-      notice('Lampa Alarm 0.7.1: ошибка регистрации настроек');
+      notice('Lampa Alarm 0.7.2: ошибка регистрации настроек');
     }
     // Let the native Settings.main().update() build the menu entry and bind
     // the built-in hover:enter handler. Never append a data-static fallback.
@@ -2354,6 +2505,7 @@
       getOnlineReplayCandidate: onlineReplayCandidate,
       listOnlineComponents: onlineComponentInventory,
       getOnlineLaunchStatus: onlineStatus,
+      getOnlineRowsDiagnostics: onlineRowDiagnostics,
       testOnlineRoute: function(){return startOnlineReplay(true)},
       openOnlineSource: function(){return startOnlineReplay(false)},
       cancelOnlineRoute: cancelOnlineRoute,
@@ -2370,7 +2522,7 @@
         } : null;
       },
       check: checkSchedule,
-      test: function () { notice('Lampa Alarm 0.7.1: тест пройден.'); }
+      test: function () { notice('Lampa Alarm 0.7.2: тест пройден.'); }
     };
     log('Initialized');
   }
