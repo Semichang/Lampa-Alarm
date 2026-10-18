@@ -1,9 +1,9 @@
 (function () {
   'use strict';
 
-  // Lampa Alarm v0.6.0: one-shot startup test and manual TorrServer replay.
+  // Lampa Alarm v0.6.1: one-shot startup test and manual TorrServer replay.
   // Scheduled playback and Android system-volume control are still disabled.
-  var VERSION = '0.6.0';
+  var VERSION = '0.6.1';
   var COMPONENT = 'lampa_alarm';
   var PREFIX = 'la_';
   var ICON = '<svg viewBox="0 0 24 24" width="24" height="24" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v5l4 2" fill="none" stroke="currentColor" stroke-width="2"/></svg>';
@@ -18,8 +18,8 @@
     { id: 0, title: 'Воскресенье' }
   ];
 
-  if (window.__lampaAlarm060Loaded) return;
-  window.__lampaAlarm060Loaded = true;
+  if (window.__lampaAlarm061Loaded) return;
+  window.__lampaAlarm061Loaded = true;
 
   // Best-effort wake detection: this cannot identify the TV power-on reason.
   // Unknown/unobserved wake never triggers a wake-guarded alarm.
@@ -442,6 +442,8 @@
   var lastFullCard = null;
   var lastOnlineContext = null;
   var playerCreateContext = null;
+  var lastRawPlayback = null;
+  var lastRawAt = 0;
 
   function plainLabel(value, maxLength) {
     if (typeof value !== 'string' && typeof value !== 'number') return '';
@@ -458,37 +460,59 @@
   }
 
   function extractEpisodeFromTitle(value) {
-    var s = plainLabel(value, 240);
-    if (!s) return { season: null, episode: null, method: '' };
-    var matches, a=null, b=null;
-    // Common "S02E03", "S2.E3", "Season 2 Episode 3" and "2x03".
-    matches = /(?:^|[^a-z0-9])s(?:eason)?\s*0*(\d{1,2})[\s._:/-]*e(?:p(?:isode)?)?\s*0*(\d{1,3})(?!\d)/i.exec(s);
-    if (matches) { a=numberOrNull(matches[1]);b=numberOrNull(matches[2]); }
-    if (!a || !b) {
-      matches = /(?:^|[^a-z0-9])0*(\d{1,2})\s*x\s*0*(\d{1,3})(?!\d)/i.exec(s);
-      if (matches) { a=numberOrNull(matches[1]);b=numberOrNull(matches[2]); }
+    var s=plainLabel(value,240);
+    if(!s) return {season:null,episode:null,method:''};
+    var a=null,b=null,m;
+    // Paired markers have priority over individual numbers. Use narrow
+    // expressions to avoid confusing "2 сезон 8 серия" with season 8.
+    m=/(?:^|[^a-z0-9])s(?:eason)?\s*0*(\d{1,2})[\s._:/-]*e(?:p(?:isode)?)?\s*0*(\d{1,3})(?!\d)/i.exec(s);
+    if(m){a=numberOrNull(m[1]);b=numberOrNull(m[2]);}
+    if(!a||!b){
+      m=/(?:^|[^\d])0*(\d{1,2})\s*x\s*0*(\d{1,3})(?!\d)/i.exec(s);
+      if(m){a=numberOrNull(m[1]);b=numberOrNull(m[2]);}
     }
-    // "S1 / Серия 5", "Сезон 2 / Серия 9", "Season 1 / Episode 3".
-    if (!a || !b) {
-      matches = /(?:сезон(?:а|е)?|season|s)\s*№?\s*0*(\d{1,2})[\s\S]{0,32}?(?:сер(?:ия|ии|ию)|эпизод|episode|ep\.?)\s*№?\s*0*(\d{1,3})(?!\d)/i.exec(s);
-      if (matches) { a=numberOrNull(matches[1]);b=numberOrNull(matches[2]); }
+    // "S03 / 5" is a standard compact series/episode label.
+    if(!a||!b){
+      m=/(?:^|[^a-z0-9])s\s*0*(\d{1,2})\s*[/._-]\s*0*(\d{1,3})(?!\d)/i.exec(s);
+      if(m){a=numberOrNull(m[1]);b=numberOrNull(m[2]);}
     }
-    // "2 сезон 5 серия" (season index appears before Russian label).
-    if (!a || !b) {
-      matches = /(?:^|[^\d])0*(\d{1,2})\s*(?:-?(?:й|ый|го))?\s*сезон[\s\S]{0,32}?(?:сер(?:ия|ии|ию)|эпизод)\s*№?\s*0*(\d{1,3})(?!\d)/i.exec(s);
-      if(matches){a=numberOrNull(matches[1]);b=numberOrNull(matches[2]);}
+    // "2 сезон 8 серия", "2-й сезон, 8-я серия".
+    if(!a||!b){
+      m=/(?:^|[^\d])0*(\d{1,2})\s*(?:-?(?:й|ый|го))?\s*сезон[\s\S]{0,35}?(?:^|[^\d])0*(\d{1,3})\s*(?:-?(?:я|ая|ой))?\s*сер(?:ия|ии|ию|ий)(?![а-я])/i.exec(s);
+      if(m){a=numberOrNull(m[1]);b=numberOrNull(m[2]);}
     }
-    if (!a || !b) {
-      // We may safely identify an episode without assuming a season.
-      matches = /(?:сер(?:ия|ии|ию)|эпизод|episode|ep\.?)\s*№?\s*0*(\d{1,3})(?!\d)/i.exec(s);
-      if (matches) b=numberOrNull(matches[1]);
-      matches = /(?:сезон(?:а|е)?|season)\s*№?\s*0*(\d{1,2})(?!\d)/i.exec(s);
-      if (matches) a=numberOrNull(matches[1]);
+    // "5 серия 2 сезона".
+    if(!a||!b){
+      m=/(?:^|[^\d])0*(\d{1,3})\s*(?:-?(?:я|ая|ой))?\s*сер(?:ия|ии|ию|ий)[\s\S]{0,35}?(?:^|[^\d])0*(\d{1,2})\s*(?:-?(?:й|ый|го))?\s*сезон/i.exec(s);
+      if(m){a=numberOrNull(m[2]);b=numberOrNull(m[1]);}
     }
-    return { season: a, episode: b, method: a && b ? 'название' : b ? 'частично из названия' : '' };
+    // "Сезон 2 / Серия 9", "S1 / Серия 5",
+    // "Season 1 / Episode 3".
+    if(!a||!b){
+      m=/(?:сезон(?:а|е)?|season|(?:^|[^a-z])s)\s*№?\s*0*(\d{1,2})[\s\S]{0,38}?(?:сер(?:ия|ии|ию|ий)|эпизод|episode|ep\.?)\s*№?\s*0*(\d{1,3})(?!\d)/i.exec(s);
+      if(m){a=numberOrNull(m[1]);b=numberOrNull(m[2]);}
+    }
+    if(!a||!b){
+      // Partial information is kept partial, never fabricated.
+      m=/(?:сер(?:ия|ии|ию|ий)|эпизод|episode|ep\.?)\s*№?\s*0*(\d{1,3})(?!\d)/i.exec(s);
+      if(m)b=numberOrNull(m[1]);
+      if(!b){
+        m=/(?:^|[^\d])0*(\d{1,3})\s*(?:-?(?:я|ая|ой))?\s*сер(?:ия|ии|ию|ий)(?![а-я])/i.exec(s);
+        if(m)b=numberOrNull(m[1]);
+      }
+      m=/(?:сезон(?:а|е)?|season)\s*№?\s*0*(\d{1,2})(?!\d)/i.exec(s);
+      if(m && !/(?:^|[^\d])\d+\s*(?:-?(?:й|ый|го))?\s*сезон/i.test(s))
+        a=numberOrNull(m[1]);
+      if(!a){
+        m=/(?:^|[^\d])0*(\d{1,2})\s*(?:-?(?:й|ый|го))?\s*сезон/i.exec(s);
+        if(m)a=numberOrNull(m[1]);
+      }
+    }
+    return {season:a,episode:b,
+      method:a&&b?'название':b?'частично из названия':''};
   }
 
-  function episodeMetadata(data) {
+  function episodeMetadata(data, context) {
     var tl = data && data.timeline && typeof data.timeline === 'object' ? data.timeline : {};
     var nested = [];
     if (data) {
@@ -506,7 +530,8 @@
       data && data.title, data && data.fname, data && data.name,
       data && data.episodeTitle, data && data.episode_title,
       tl && tl.title, data && data.element && data.element.title,
-      data && data.item && data.item.title
+      data && data.item && data.item.title,
+      context && context.focusedTitle
     ];
     for(var j=0;j<fields.length;j++){
       var parsed=extractEpisodeFromTitle(fields[j]);
@@ -532,6 +557,32 @@
       (activity.object && (activity.object.movie || activity.object.card)) || null;
   }
 
+  function getFocusedSeriesLabel(activity) {
+    try {
+      var view=activity && activity.activity &&
+        typeof activity.activity.render==='function' ?
+        activity.activity.render() : null;
+      if (!view || typeof view.find!=='function') return '';
+      // Read only a currently focused episode row of the active media screen.
+      // No script URL, cookie, or network response is captured.
+      var selectors=[
+        '.online.selector.focus .online__title',
+        '.online.focus .online__title',
+        '.torrent-item.focus .online__title',
+        '.selector.focus .online__title'
+      ];
+      for(var i=0;i<selectors.length;i++){
+        var row=view.find(selectors[i]);
+        if(row && row.length && typeof row.first==='function' &&
+           typeof row.first().text==='function'){
+          var label=plainLabel(row.first().text(),180);
+          if(label)return label;
+        }
+      }
+    }catch(e){log('Focused episode inspection failed: '+e.message);}
+    return '';
+  }
+
   function activitySnapshot(activity, selected, allowRecentFull) {
     if (!activity || !selected) return null;
     var component=plainLabel(activity.component || '',100);
@@ -541,15 +592,18 @@
     if (card && (card.id || card.tmdb_id)) {
       if (!isSameCard(card,selected)) return null;
       return { at:Date.now(),component:component,
-        title:plainLabel(activity.title || '',100), method:'активный экран',
+        title:plainLabel(activity.title || '',100),
+        focusedTitle:getFocusedSeriesLabel(activity),
+        method:'активный экран',
         selectedId:selected.id, selectedSource:selected.source };
     }
     if (allowRecentFull && sourceComponentIsOnline(component) &&
         lastFullCard && lastFullCard.selectedId===selected.id &&
         lastFullCard.selectedSource===selected.source &&
-        Date.now()-lastFullCard.at<=120000) {
+        Date.now()-lastFullCard.at<=30000) {
       return {at:Date.now(),component:component,
         title:plainLabel(activity.title || '',100),
+        focusedTitle:getFocusedSeriesLabel(activity),
         method:'онлайн-экран после карточки',selectedId:selected.id,
         selectedSource:selected.source};
     }
@@ -564,17 +618,32 @@
   }
 
   function contextForPlayback(selected) {
-    var active=detectActivityContext(selected);
-    if (active) {
-      lastOnlineContext=active;
-      return active;
+    var activeActivity=null;
+    try {
+      if (Lampa.Activity && typeof Lampa.Activity.active==='function')
+        activeActivity=Lampa.Activity.active();
+    } catch(e){}
+    if(activeActivity){
+      var direct=activitySnapshot(activeActivity,selected,true);
+      if(direct){
+        lastOnlineContext=direct;
+        return direct;
+      }
+      var component=String(activeActivity.component||'');
+      var card=getCardFromActivity(activeActivity);
+      // Do not reuse an earlier series after navigating to another page.
+      if ((card && (card.id || card.tmdb_id)) ||
+          (component && !/^(?:player|player-loading)$/i.test(component)))
+        return null;
     }
-    if (playerCreateContext && Date.now()-playerCreateContext.at<=120000 &&
-        playerCreateContext.selectedId===selected.id &&
-        playerCreateContext.selectedSource===selected.source) return playerCreateContext;
-    if (lastOnlineContext && Date.now()-lastOnlineContext.at<=30000 &&
-        lastOnlineContext.selectedId===selected.id &&
-        lastOnlineContext.selectedSource===selected.source) return lastOnlineContext;
+    if(playerCreateContext && Date.now()-playerCreateContext.at<=20000 &&
+       playerCreateContext.selectedId===selected.id &&
+       playerCreateContext.selectedSource===selected.source)
+      return playerCreateContext;
+    if(lastOnlineContext && Date.now()-lastOnlineContext.at<=10000 &&
+       lastOnlineContext.selectedId===selected.id &&
+       lastOnlineContext.selectedSource===selected.source)
+      return lastOnlineContext;
     return null;
   }
 
@@ -737,17 +806,23 @@
       }
 
       var tl=data.timeline && typeof data.timeline==='object'?data.timeline:{};
-      var metadata=episodeMetadata(data);
+      var metadata=episodeMetadata(data,context);
       var isTorrent=Boolean(data.torrent_hash ||
         parseTorrentStreamUrl(data.url).hash);
       var provider=providerForPlayback(data,context,selected,isTorrent);
       var old=lastPlayback();
       // Preserve richer data across the internal-start / Android-external
       // pair for the same episode (the second event may omit metadata).
+      // Reuse metadata only for the same stream handed off between
+      // internal and external player events; never copy it to a new episode.
       var sameRecent=old && old.seriesId===selected.id &&
         old.source===selected.source &&
         old.sourceType===(isTorrent?'torrent':'online') &&
-        Date.now()-Date.parse(old.capturedAt||0)<120000;
+        lastRawPlayback && data &&
+        Date.now()-lastRawAt<=15000 &&
+        (data===lastRawPlayback ||
+          (typeof data.url==='string' && data.url &&
+            data.url===lastRawPlayback.url));
       if(sameRecent && !metadata.season) metadata.season=numberOrNull(old.season);
       if(sameRecent && !metadata.episode) metadata.episode=numberOrNull(old.episode);
       if (sameRecent && !provider.component) {
@@ -774,6 +849,8 @@
         ended:false,capturedAt:new Date().toISOString()
       };
       currentPlayback=series;
+      lastRawPlayback=data;
+      lastRawAt=Date.now();
       save('last_playback',series);
       saveHistory(series);
       setCaptureDiagnostic(series.episode ?
@@ -1344,7 +1421,7 @@
     addParam('test', 'button', 'Проверить уведомление',
       'Покажет тестовое уведомление. Видео не запустится, громкость не изменится.', '', null,
       function () {
-        notice('Lampa Alarm 0.6.0: тест пройден, настройки доступны.');
+        notice('Lampa Alarm 0.6.1: тест пройден, настройки доступны.');
         log('Manual test performed');
       });
     addParam('status', 'button', 'Показать текущие настройки',
@@ -1365,7 +1442,7 @@
       setupSettings();
     } catch (e) {
       log('Setup failed: ' + e.message);
-      notice('Lampa Alarm 0.6.0: ошибка регистрации настроек');
+      notice('Lampa Alarm 0.6.1: ошибка регистрации настроек');
     }
     // Let the native Settings.main().update() build the menu entry and bind
     // the built-in hover:enter handler. Never append a data-static fallback.
@@ -1385,6 +1462,11 @@
           if (!selected) return;
           var ctx=activitySnapshot(e.object,selected,true);
           if(ctx)lastOnlineContext=ctx;
+          else if(e.object && e.object.component &&
+              !/^(?:player|player-loading)$/i.test(e.object.component)) {
+            lastOnlineContext=null;
+            playerCreateContext=null;
+          }
         });
       if (Lampa.Listener && typeof Lampa.Listener.follow === 'function')
         Lampa.Listener.follow('torrent_file', onTorrentFileEvent);
@@ -1437,7 +1519,7 @@
         } : null;
       },
       check: checkSchedule,
-      test: function () { notice('Lampa Alarm 0.6.0: тест пройден.'); }
+      test: function () { notice('Lampa Alarm 0.6.1: тест пройден.'); }
     };
     log('Initialized');
   }
