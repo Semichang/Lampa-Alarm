@@ -2358,7 +2358,7 @@
 
   function autoWakeForSchedule(now,scheduledAt) {
     var windowMs=autoClockWindowMs();
-    var mode=String(read('auto_start_mode','resume_or_start'));
+    var mode=String(read('auto_start_mode','resume_only'));
     var list=[];
     if(autoWakeObservation)list.push(autoWakeObservation);
     if(mode==='resume_or_start' && autoColdStartObservation)
@@ -2456,7 +2456,7 @@
     var enabledText=!data.enabled?'будильник выключен':
       !data.autoPlayback?'автозапуск выключен':'автозапуск включён';
     return 'Будильник '+data.time+', '+enabledText+
-      ', дней '+data.days.length+'/7. '+(plan.ok?plan.message:plan.message)+
+      ', дней '+data.days.length+'/7. '+plan.message+
       '. После сна: '+(data.autoStartMode==='resume_only'?
         'только возобновление Lampa':'возобновление или новый запуск Lampa');
   }
@@ -2467,7 +2467,9 @@
     var status=data.source==='torrent'?launchReport():
       data.source==='online'?onlineStatus():null;
     var actual='';
-    if(status && status.stage)actual='; плеер: '+status.message;
+    if(status && status.stage && status.updatedAt &&
+       Date.parse(status.updatedAt)>=Date.parse(data.at)-3000)
+      actual='; плеер: '+status.message;
     return data.message+actual+
       (data.wake?'; событие: '+data.wake:'');
   }
@@ -2555,7 +2557,7 @@
       version: VERSION,
       enabled: enabled('enabled', false),
       autoPlayback: enabled('auto_playback', false),
-      autoStartMode: String(read('auto_start_mode','resume_or_start')),
+      autoStartMode: String(read('auto_start_mode','resume_only')),
       autoMinSleep: Number(read('auto_min_sleep','15')),
       autoWindow: Number(read('auto_window','5')),
       autoLastAttemptDate: String(read('auto_last_attempt_date','')),
@@ -2652,7 +2654,7 @@
     addParam('auto_start_mode','select','Как распознавать включение',
       '«Только после сна» безопаснее. «Также при запуске Lampa» может '+
       'сработать и при ручном открытии приложения в указанное время.',
-      'resume_or_start',{
+      'resume_only',{
         resume_only:'Только после наблюдаемого сна Lampa',
         resume_or_start:'После сна или нового запуска Lampa'
       });
