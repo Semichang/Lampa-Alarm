@@ -2681,6 +2681,18 @@
     addParam('auto_last_result','button','Последняя попытка автозапуска',
       'Покажет попытку по расписанию и результат плеера.',
       '',null,function(){notice(autoStatusText())});
+    addParam('auto_reset_test','button','Разрешить повторную проверку сегодня',
+      'Для тестирования: снять блокировку повторного запуска в этот день. '+
+      'Сам сериал без нового пробуждения не запускается.',
+      '',null,function(){
+        if(!read('auto_last_attempt_date','')){
+          notice('Сегодня автоматической попытки ещё не было');
+          return;
+        }
+        save('auto_last_attempt_date','');
+        notice('Сегодня снова разрешена одна попытка по расписанию. '+
+          'Для проверки выключи ТВ и дождись следующего пробуждения.');
+      });
     Lampa.SettingsApi.addParam({
       component:COMPONENT,
       param:{name:PREFIX+'time_picker',type:'button'},
