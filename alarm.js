@@ -1,9 +1,9 @@
 (function () {
   'use strict';
 
-  // Lampa Alarm v0.3.0: settings and schedule notification only.
+  // Lampa Alarm v0.4.0: settings and schedule notification only.
   // This version intentionally does not start videos or change Android volume.
-  var VERSION = '0.3.0';
+  var VERSION = '0.4.0';
   var COMPONENT = 'lampa_alarm';
   var PREFIX = 'la_';
   var ICON = '<svg viewBox="0 0 24 24" width="24" height="24" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v5l4 2" fill="none" stroke="currentColor" stroke-width="2"/></svg>';
@@ -18,8 +18,8 @@
     { id: 0, title: 'Воскресенье' }
   ];
 
-  if (window.__lampaAlarm030Loaded) return;
-  window.__lampaAlarm030Loaded = true;
+  if (window.__lampaAlarm040Loaded) return;
+  window.__lampaAlarm040Loaded = true;
 
   // Best-effort wake detection: this cannot identify the TV power-on reason.
   // Unknown/unobserved wake never triggers a wake-guarded alarm.
@@ -208,6 +208,177 @@
     }
   }
 
+
+  // Passive playback observations. Never persist stream URLs, auth headers,
+  // playlists, JavaScript callbacks, or other potentially expiring credentials.
+  var currentPlayback = null;
+  var activeVideoHandlers = null;
+  var lastProgressWrite = 0;
+
+  function lastPlayback() {
+    try {
+      var item = Lampa.Storage.get(PREFIX + 'last_playback', '');
+      if (!item || typeof item !== 'object' || !item.seriesId) return null;
+      return item;
+    } catch (e) {
+      log('Read playback failed: ' + e.message);
+      return null;
+    }
+  }
+
+  function isSameCard(candidate, selected) {
+    if (!candidate || !selected || typeof candidate !== 'object') return false;
+    var id = candidate.id || candidate.tmdb_id;
+    if (!id || String(id) !== selected.id) return false;
+    var source = candidate.source;
+    if (source && String(source) !== selected.source) return false;
+    return true;
+  }
+
+  function timelineKeyForSeries(selected) {
+    var key = 'tv_' + selected.id;
+    if (selected.source !== 'tmdb' && selected.source !== 'cub')
+      key = selected.source + '_' + key;
+    return key.toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 64);
+  }
+
+  function matchPlayback(data, selected) {
+    if (!data || !selected) return null;
+
+    if (data.card && isSameCard(data.card, selected)) return 'card';
+    if (data.movie && isSameCard(data.movie, selected)) return 'movie';
+    // If the player explicitly identifies a different card, never
+    // fall back to the current screen or match by title.
+    if ((data.card && data.card.id) || (data.movie && data.movie.id)) return null;
+
+    var timeline = data.timeline;
+    if (timeline && typeof timeline === 'object' &&
+        timeline.card && String(timeline.card) === timelineKeyForSeries(selected))
+      return 'timeline';
+
+    if (timeline && timeline.card) return null;
+
+    // Only use Activity metadata on a recognized media-list screen.
+    // Even then, this is just a diagnostic observation, not proof that the
+    // stream belongs to the series, so do not use it for a persisted match.
+    return null;
+  }
+
+  function episodeNumber(value) {
+    var n = Number(value);
+    return isFinite(n) && n > 0 && n < 10000 && Math.floor(n) === n ? n : null;
+  }
+
+  function capturePlayback(data, mode) {
+    try {
+      if (!enabled('capture_playback', true)) return null;
+      var selected = selectedSeries();
+      var match = matchPlayback(data, selected);
+      if (!match) {
+        currentPlayback = null;
+        return null;
+      }
+
+      var tl = data.timeline && typeof data.timeline === 'object' ?
+        data.timeline : {};
+      var series = {
+        seriesId: selected.id,
+        title: selected.title,
+        source: selected.source,
+        sourceType: data.torrent_hash ? 'torrent' : 'online',
+        playerMode: mode,
+        matchMethod: match,
+        season: episodeNumber(tl.season || data.season),
+        episode: episodeNumber(tl.episode || data.episode),
+        episodeTitle: String(data.title || '').slice(0, 200),
+        positionSeconds: Number(tl.time) > 0 ? Math.round(Number(tl.time)) : 0,
+        durationSeconds: Number(tl.duration) > 0 ? Math.round(Number(tl.duration)) : 0,
+        ended: false,
+        capturedAt: new Date().toISOString()
+      };
+
+      currentPlayback = series;
+      save('last_playback', series);
+      log('Captured ' + series.sourceType + ' playback, match=' + match +
+          ', season=' + series.season + ', episode=' + series.episode);
+      return series;
+    } catch (e) {
+      log('Capture playback error: ' + e.message);
+      return null;
+    }
+  }
+
+  function clearVideoHandlers() {
+    if (!activeVideoHandlers || !Lampa.PlayerVideo ||
+        !Lampa.PlayerVideo.listener) return;
+    var bus = Lampa.PlayerVideo.listener;
+    try {
+      bus.remove('timeupdate', activeVideoHandlers.progress);
+      bus.remove('ended', activeVideoHandlers.end);
+    } catch (e) { log('Video cleanup error: ' + e.message); }
+    activeVideoHandlers = null;
+  }
+
+  function onPlayerStart(data) {
+    clearVideoHandlers();
+    var observation = capturePlayback(data, 'internal');
+    if (!observation || !Lampa.PlayerVideo || !Lampa.PlayerVideo.listener) return;
+
+    var progress = function (e) {
+      if (!currentPlayback || currentPlayback !== observation) return;
+      var position = Number(e && e.current);
+      var duration = Number(e && e.duration);
+      if (!isFinite(position) || position < 0) return;
+      currentPlayback.positionSeconds = Math.round(position);
+      if (isFinite(duration) && duration > 0)
+        currentPlayback.durationSeconds = Math.round(duration);
+
+      var now = Date.now();
+      if (now - lastProgressWrite >= 30000) {
+        lastProgressWrite = now;
+        save('last_playback', currentPlayback);
+      }
+    };
+    var ended = function () {
+      if (!currentPlayback || currentPlayback !== observation) return;
+      currentPlayback.ended = true;
+      currentPlayback.positionSeconds = currentPlayback.durationSeconds;
+      save('last_playback', currentPlayback);
+    };
+    try {
+      Lampa.PlayerVideo.listener.follow('timeupdate', progress);
+      Lampa.PlayerVideo.listener.follow('ended', ended);
+      activeVideoHandlers = { progress: progress, end: ended };
+    } catch (e) { log('Video listeners error: ' + e.message); }
+  }
+
+  function onPlayerExternal(data) {
+    clearVideoHandlers();
+    capturePlayback(data, 'external');
+  }
+
+  function onPlayerDestroy() {
+    if (currentPlayback && currentPlayback.playerMode === 'internal')
+      save('last_playback', currentPlayback);
+    currentPlayback = null;
+    clearVideoHandlers();
+  }
+
+  function formatPlayback(item) {
+    if (!item) return 'Данных нет. Выбери сериал и запусти его обычным способом.';
+    var episode = item.season && item.episode ?
+      ' — сезон ' + item.season + ', серия ' + item.episode : ' — номер серии не определён';
+    var source = item.sourceType === 'torrent' ? 'TorrServer' : 'Онлайн';
+    var player = item.playerMode === 'external' ? 'внешний плеер' : 'плеер Lampa';
+    return item.title + episode + '. ' + source + ', ' + player + '.';
+  }
+
+  function clearLastPlayback() {
+    save('last_playback', '');
+    currentPlayback = null;
+    notice('Будильник: история тестового воспроизведения очищена');
+  }
+
   function settingsSnapshot() {
     var dayValues = [];
     for (var i = 0; i < 7; i++) {
@@ -229,7 +400,8 @@
       minSleepMinutes: Number(read('min_sleep', '30')),
       wakeWindowMinutes: Number(read('wake_window', '3')),
       lastWakeInfo: String(read('last_wake_info', 'не обнаружено')),
-      selectedSeries: selectedSeries()
+      selectedSeries: selectedSeries(),
+      lastPlayback: lastPlayback()
     };
   }
   function checkSchedule() {
@@ -346,6 +518,16 @@
     addParam('series_clear', 'button', 'Сбросить выбранный сериал',
       'После сброса выбери новый сериал в карточке.', '', null, clearSelectedSeries);
 
+    addTitle('Последнее воспроизведение');
+    addParam('capture_playback', 'trigger', 'Запоминать воспроизведение сериала',
+      'Сохранять только тип источника, сезон, серию и позицию. Без URL и токенов.', true);
+    addParam('playback_info', 'button', 'Последняя просмотренная серия',
+      'Показать обнаруженную серию выбранного сериала.', '', null,
+      function () { notice(formatPlayback(lastPlayback())); });
+    addParam('playback_clear', 'button', 'Очистить историю будильника',
+      'Удалить запись о последней серии, не затрагивая историю Lampa.', '', null,
+      clearLastPlayback);
+
     addTitle('Планируемое воспроизведение (пока не активно)');
     addParam('source', 'select', 'Источник серии',
       'Сохранение предпочтения: воспроизведение подключим позже.', 'last',
@@ -374,7 +556,7 @@
     addParam('test', 'button', 'Проверить уведомление',
       'Покажет тестовое уведомление. Видео не запустится, громкость не изменится.', '', null,
       function () {
-        notice('Lampa Alarm 0.3.0: тест пройден, настройки доступны.');
+        notice('Lampa Alarm 0.4.0: тест пройден, настройки доступны.');
         log('Manual test performed');
       });
     addParam('status', 'button', 'Показать текущие настройки',
@@ -395,7 +577,7 @@
       setupSettings();
     } catch (e) {
       log('Setup failed: ' + e.message);
-      notice('Lampa Alarm 0.3.0: ошибка регистрации настроек');
+      notice('Lampa Alarm 0.4.0: ошибка регистрации настроек');
     }
     // Let the native Settings.main().update() build the menu entry and bind
     // the built-in hover:enter handler. Never append a data-static fallback.
@@ -409,6 +591,16 @@
       if (Lampa.Listener && typeof Lampa.Listener.follow === 'function')
         Lampa.Listener.follow('full', addSeriesButton);
     } catch (e) { log('Card listener failed: ' + e.message); }
+    try {
+      if (Lampa.Player && Lampa.Player.listener &&
+          typeof Lampa.Player.listener.follow === 'function') {
+        Lampa.Player.listener.follow('start', onPlayerStart);
+        Lampa.Player.listener.follow('external', onPlayerExternal);
+        Lampa.Player.listener.follow('destroy', onPlayerDestroy);
+      } else {
+        log('Player listener not available');
+      }
+    } catch (e) { log('Player subscription error: ' + e.message); }
     setInterval(checkHeartbeat, 15000);
     window.addEventListener('focus', visibilityChanged);
     document.addEventListener('visibilitychange', visibilityChanged);
@@ -420,6 +612,7 @@
       version: VERSION,
       getConfig: settingsSnapshot,
       getSelectedSeries: selectedSeries,
+      getLastPlayback: lastPlayback,
       selectSeries: chooseSeries,
       clearSeries: clearSelectedSeries,
       getWakeState: function () {
@@ -430,7 +623,7 @@
         } : null;
       },
       check: checkSchedule,
-      test: function () { notice('Lampa Alarm 0.3.0: тест пройден.'); }
+      test: function () { notice('Lampa Alarm 0.4.0: тест пройден.'); }
     };
     log('Initialized');
   }
