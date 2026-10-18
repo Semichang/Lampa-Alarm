@@ -1,9 +1,9 @@
 (function () {
   'use strict';
 
-  // Lampa Alarm v0.7.2: one-shot startup test and manual TorrServer replay.
+  // Lampa Alarm v0.7.3: one-shot startup test and manual TorrServer replay.
   // Scheduled playback and Android system-volume control are still disabled.
-  var VERSION = '0.7.2';
+  var VERSION = '0.7.3';
   var COMPONENT = 'lampa_alarm';
   var PREFIX = 'la_';
   var ICON = '<svg viewBox="0 0 24 24" width="24" height="24" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v5l4 2" fill="none" stroke="currentColor" stroke-width="2"/></svg>';
@@ -18,8 +18,8 @@
     { id: 0, title: 'Воскресенье' }
   ];
 
-  if (window.__lampaAlarm072Loaded) return;
-  window.__lampaAlarm072Loaded = true;
+  if (window.__lampaAlarm073Loaded) return;
+  window.__lampaAlarm073Loaded = true;
 
   // Best-effort wake detection: this cannot identify the TV power-on reason.
   // Unknown/unobserved wake never triggers a wake-guarded alarm.
@@ -128,6 +128,112 @@
   function timeMinutes(value) {
     var match = /^([01][0-9]|2[0-3]):([0-5][0-9])$/.exec(String(value || ''));
     return match ? Number(match[1]) * 60 + Number(match[2]) : -1;
+  }
+
+  // Remote-friendly time picker. Uses Lampa's native scrollable Select list:
+  // choose hours (00–23) first, then minutes (00–59). No virtual keyboard.
+  // Existing persisted "la_time" HH:MM value is kept unchanged until both
+  // steps complete.
+  function twoDigits(value) {
+    return ('0' + String(value)).slice(-2);
+  }
+
+  function clockParts() {
+    var current=String(read('time','07:00'));
+    var parsed=timeMinutes(current);
+    if(parsed<0)parsed=7*60;
+    return {hours:Math.floor(parsed/60),minutes:parsed%60};
+  }
+
+  function clockString(hours,minutes) {
+    return twoDigits(hours)+':'+twoDigits(minutes);
+  }
+
+  function updateTimePickerText() {
+    try {
+      var root=Lampa.Settings && typeof Lampa.Settings.render==='function' ?
+        Lampa.Settings.render():null;
+      if(!root || typeof root.find!=='function')return;
+      var title=root.find('[data-name="'+PREFIX+'time_picker"] .settings-param__name');
+      if(title && title.length && typeof title.text==='function')
+        title.text('Время будильника: '+String(read('time','07:00')));
+    }catch(e){log('Clock label update error: '+e.message);}
+  }
+
+  function openTimePicker() {
+    if(!Lampa.Select || typeof Lampa.Select.show!=='function'){
+      notice('Не удалось открыть выбор времени в Lampa');return;
+    }
+    var value=clockParts(), hours=value.hours, minutes=value.minutes;
+    var back='settings_component';
+    try{
+      var ctrl=Lampa.Controller && typeof Lampa.Controller.enabled==='function' ?
+        Lampa.Controller.enabled():null;
+      if(ctrl && ctrl.name)back=ctrl.name;
+    }catch(e){}
+    function returnToSettings(){
+      try {
+        if(Lampa.Controller && typeof Lampa.Controller.toggle==='function')
+          Lampa.Controller.toggle(back);
+      }catch(e){log('Cannot return to alarm settings: '+e.message);}
+    }
+
+    function selectHours(){
+      var list=[];
+      for(var hour=0;hour<24;hour++){
+        list.push({
+          title:twoDigits(hour),
+          value:hour,
+          selected:hour===hours
+        });
+      }
+      Lampa.Select.show({
+        title:'Время будильника — часы',
+        items:list,
+        onBack:returnToSettings,
+        onSelect:function(choice){
+          var picked=Number(choice && choice.value);
+          if(!isFinite(picked)||picked<0||picked>23||Math.floor(picked)!==picked)
+            return returnToSettings();
+          hours=picked;
+          selectMinutes();
+        }
+      });
+    }
+
+    function selectMinutes(){
+      var list=[];
+      for(var minute=0;minute<60;minute++){
+        list.push({
+          title:twoDigits(minute),
+          value:minute,
+          selected:minute===minutes
+        });
+      }
+      Lampa.Select.show({
+        title:'Время будильника — '+twoDigits(hours)+' ч, выбери минуты',
+        items:list,
+        onBack:selectHours,
+        onSelect:function(choice){
+          var picked=Number(choice && choice.value);
+          if(!isFinite(picked)||picked<0||picked>59||Math.floor(picked)!==picked)
+            return returnToSettings();
+          minutes=picked;
+          var time=clockString(hours,minutes);
+          save('time',time);
+          updateTimePickerText();
+          returnToSettings();
+          notice('Будильник: установлено '+time);
+        }
+      });
+    }
+
+    try{selectHours();}
+    catch(e){
+      log('Clock picker error: '+e.message);
+      notice('Ошибка открытия выбора времени');
+      returnToSettings();
+    }
   }
   // Saved card metadata, not a playback link. Streaming URLs are resolved later.
   function selectedSeries() {
@@ -2265,11 +2371,19 @@
     addTitle('Расписание');
     addParam('enabled', 'trigger', 'Будильник включён',
       'Проверка времени работает только пока Lampa запущена или возобновила работу.', false);
-    addParam('time', 'input', 'Время запуска (ЧЧ:ММ)',
-      'Например, 07:00. Если время некорректно, срабатывание блокируется.', '07:00', null,
-      function (value) {
-        if (timeMinutes(value) < 0) notice('Будильник: укажи время в формате 07:00');
-      });
+    Lampa.SettingsApi.addParam({
+      component:COMPONENT,
+      param:{name:PREFIX+'time_picker',type:'button'},
+      field:{
+        name:'Время будильника',
+        description:'Нажми ОК: сначала прокрути часы, затем минуты. Без клавиатуры.'
+      },
+      onRender:function(item){
+        item.find('.settings-param__name')
+          .text('Время будильника: '+String(read('time','07:00')));
+      },
+      onChange:openTimePicker
+    });
     addTitle('Дни недели');
     for (var i = 0; i < weekdays.length; i++) {
       (function (day) {
@@ -2426,7 +2540,7 @@
     addParam('test', 'button', 'Проверить уведомление',
       'Покажет тестовое уведомление. Видео не запустится, громкость не изменится.', '', null,
       function () {
-        notice('Lampa Alarm 0.7.2: тест пройден, настройки доступны.');
+        notice('Lampa Alarm 0.7.3: тест пройден, настройки доступны.');
         log('Manual test performed');
       });
     addParam('status', 'button', 'Показать текущие настройки',
@@ -2447,7 +2561,7 @@
       setupSettings();
     } catch (e) {
       log('Setup failed: ' + e.message);
-      notice('Lampa Alarm 0.7.2: ошибка регистрации настроек');
+      notice('Lampa Alarm 0.7.3: ошибка регистрации настроек');
     }
     // Let the native Settings.main().update() build the menu entry and bind
     // the built-in hover:enter handler. Never append a data-static fallback.
@@ -2535,7 +2649,7 @@
         } : null;
       },
       check: checkSchedule,
-      test: function () { notice('Lampa Alarm 0.7.2: тест пройден.'); }
+      test: function () { notice('Lampa Alarm 0.7.3: тест пройден.'); }
     };
     log('Initialized');
   }
