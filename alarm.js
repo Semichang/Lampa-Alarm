@@ -1,9 +1,9 @@
 (function () {
   'use strict';
 
-  // Lampa Alarm v0.2.1: settings and schedule notification only.
+  // Lampa Alarm v0.2.2: settings and schedule notification only.
   // This version intentionally does not start videos or change Android volume.
-  var VERSION = '0.2.1';
+  var VERSION = '0.2.2';
   var COMPONENT = 'lampa_alarm';
   var PREFIX = 'la_';
   var ICON = '<svg viewBox="0 0 24 24" width="24" height="24" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v5l4 2" fill="none" stroke="currentColor" stroke-width="2"/></svg>';
@@ -18,8 +18,63 @@
     { id: 0, title: 'Воскресенье' }
   ];
 
-  if (window.__lampaAlarm021Loaded) return;
-  window.__lampaAlarm020Loaded = true;
+  if (window.__lampaAlarm022Loaded) return;
+  window.__lampaAlarm022Loaded = true;
+
+  // Best-effort wake detection: this cannot identify the TV power-on reason.
+  // Unknown/unobserved wake never triggers a wake-guarded alarm.
+  var wakeObservation = null;
+  var hiddenAt = null;
+  var lastHeartbeatAt = Date.now();
+  var lastInteractionAt = 0;
+
+  function markInteraction() { lastInteractionAt = Date.now(); }
+
+  function wakeThresholdMs() {
+    var minutes = Number(read('min_sleep', '30'));
+    return (minutes > 0 && minutes <= 180 ? minutes : 30) * 60000;
+  }
+
+  function rememberWake(reason, inactivityMs, now) {
+    if (inactivityMs < wakeThresholdMs()) return;
+    wakeObservation = { at: now, reason: reason, inactivityMs: inactivityMs };
+    save('last_wake_info', new Date(now).toLocaleString() + ' / ' +
+      reason + ' / ' + Math.round(inactivityMs / 60000) + ' мин');
+    log('Inactivity observed: ' + reason + ', ' + Math.round(inactivityMs / 1000) + ' seconds');
+  }
+
+  function checkHeartbeat() {
+    var now = Date.now();
+    var gap = now - lastHeartbeatAt;
+    lastHeartbeatAt = now;
+    if (!document.hidden && gap >= wakeThresholdMs()) {
+      rememberWake('пауза таймера', gap, now);
+    }
+    checkSchedule();
+  }
+
+  function visibilityChanged() {
+    var now = Date.now();
+    if (document.hidden) {
+      hiddenAt = now;
+      return;
+    }
+    if (hiddenAt !== null) {
+      rememberWake('возврат приложения', now - hiddenAt, now);
+      hiddenAt = null;
+    } else {
+      var gap = now - lastHeartbeatAt;
+      if (gap >= wakeThresholdMs()) rememberWake('пауза таймера', gap, now);
+    }
+    lastHeartbeatAt = now;
+    checkSchedule();
+  }
+
+  function wakeStatusText() {
+    if (!wakeObservation) return 'После запуска Lampa признаков пробуждения не было.';
+    return 'Наблюдение: ' + wakeObservation.reason + ', ' +
+      Math.round(wakeObservation.inactivityMs / 60000) + ' мин простоя.';
+  }
 
   function log(message) {
     try { console.log('[Lampa Alarm ' + VERSION + '] ' + message); } catch (ignored) {}
@@ -77,7 +132,11 @@
       startFractionPercent: Number(read('start_fraction', '15')),
       maxVolumePercent: Number(read('max_volume', '20')),
       rampMinutes: Number(read('ramp_minutes', '10')),
-      lastRun: String(read('last_run', ''))
+      lastRun: String(read('last_run', '')),
+      wakeOnly: enabled('wake_only', false),
+      minSleepMinutes: Number(read('min_sleep', '30')),
+      wakeWindowMinutes: Number(read('wake_window', '3')),
+      lastWakeInfo: String(read('last_wake_info', 'не обнаружено'))
     };
   }
   function checkSchedule() {
@@ -89,8 +148,20 @@
       if (scheduled < 0 || data.days.indexOf(now.getDay()) < 0) return;
       var minute = now.getHours() * 60 + now.getMinutes();
       // Allow ten minutes for Lampa to resume after TV power-on, not all day.
-      if (minute < scheduled || minute > scheduled + 10) return;
+      var allowedDelay = data.wakeOnly ? data.wakeWindowMinutes : 10;
+      if (minute < scheduled || minute > scheduled + allowedDelay) return;
       var key = keyForDate(now);
+      if (data.wakeOnly) {
+        // A fresh opening of Lampa at 07:00 is NOT evidence that the TV woke.
+        // JavaScript cannot distinguish a TV wake from returning from another app.
+        if (!wakeObservation) return;
+        var scheduledAt = new Date(now.getFullYear(), now.getMonth(), now.getDate(),
+          Math.floor(scheduled / 60), scheduled % 60).getTime();
+        var windowMs = allowedDelay * 60000;
+        if (Math.abs(wakeObservation.at - scheduledAt) > windowMs ||
+            now.getTime() - wakeObservation.at > windowMs ||
+            lastInteractionAt >= wakeObservation.at) return;
+      }
       if (data.lastRun === key) return;
       save('last_run', key);
       notice('Lampa Alarm: время будильника ' + data.time + '. Видео и громкость подключим в следующей версии.');
@@ -141,6 +212,20 @@
       })(weekdays[i]);
     }
 
+    addTitle('Защита от случайного запуска (эксперимент)');
+    addParam('wake_only', 'trigger', 'Только после пробуждения',
+      'Сработает лишь если Lampa заметила долгую паузу и возобновление. ' +
+      'Не всегда распознаёт включение TV. По умолчанию выключено.', false);
+    addParam('min_sleep', 'select', 'Минимальный простой',
+      'Не менее скольких минут Lampa должна быть неактивна.', '30',
+      { '15': '15 минут', '30': '30 минут', '60': '1 час' });
+    addParam('wake_window', 'select', 'Окно после пробуждения',
+      'Как близко к времени будильника должно произойти возобновление Lampa.', '3',
+      { '1': '1 минута', '3': '3 минуты', '5': '5 минут' });
+    addParam('wake_status', 'button', 'Проверить обнаружение сна',
+      'Показывает последний обнаруженный в этой сессии длительный простой.', '', null,
+      function () { notice(wakeStatusText()); });
+
     addTitle('Планируемое воспроизведение (пока не активно)');
     addParam('source', 'select', 'Источник серии',
       'Сохранение предпочтения: воспроизведение подключим позже.', 'last',
@@ -169,7 +254,7 @@
     addParam('test', 'button', 'Проверить уведомление',
       'Покажет тестовое уведомление. Видео не запустится, громкость не изменится.', '', null,
       function () {
-        notice('Lampa Alarm 0.2.1: тест пройден, настройки доступны.');
+        notice('Lampa Alarm 0.2.2: тест пройден, настройки доступны.');
         log('Manual test performed');
       });
     addParam('status', 'button', 'Показать текущие настройки',
@@ -190,7 +275,7 @@
       setupSettings();
     } catch (e) {
       log('Setup failed: ' + e.message);
-      notice('Lampa Alarm 0.2.1: ошибка регистрации настроек');
+      notice('Lampa Alarm 0.2.2: ошибка регистрации настроек');
     }
     // Let the native Settings.main().update() build the menu entry and bind
     // the built-in hover:enter handler. Never append a data-static fallback.
@@ -198,17 +283,25 @@
       var main = Lampa.Settings.main();
       if (main && typeof main.update === 'function') main.update();
     } catch (e) { log('Native menu update error: ' + e.message); }
-    setInterval(checkSchedule, 15000);
-    window.addEventListener('focus', checkSchedule);
-    document.addEventListener('visibilitychange', function () {
-      if (!document.hidden) checkSchedule();
-    });
+    setInterval(checkHeartbeat, 15000);
+    window.addEventListener('focus', visibilityChanged);
+    document.addEventListener('visibilitychange', visibilityChanged);
+    document.addEventListener('keydown', markInteraction, false);
+    document.addEventListener('mousedown', markInteraction, false);
+    document.addEventListener('touchstart', markInteraction, false);
     checkSchedule();
     window.LampaAlarm = {
       version: VERSION,
       getConfig: settingsSnapshot,
+      getWakeState: function () {
+        return wakeObservation ? {
+          at: wakeObservation.at,
+          reason: wakeObservation.reason,
+          inactivityMs: wakeObservation.inactivityMs
+        } : null;
+      },
       check: checkSchedule,
-      test: function () { notice('Lampa Alarm 0.2.1: тест пройден.'); }
+      test: function () { notice('Lampa Alarm 0.2.2: тест пройден.'); }
     };
     log('Initialized');
   }
