@@ -1,9 +1,9 @@
 (function () {
   'use strict';
 
-  // Lampa Alarm v0.5.1: one-shot startup test and manual TorrServer replay.
+  // Lampa Alarm v0.6.0: one-shot startup test and manual TorrServer replay.
   // Scheduled playback and Android system-volume control are still disabled.
-  var VERSION = '0.5.1';
+  var VERSION = '0.6.0';
   var COMPONENT = 'lampa_alarm';
   var PREFIX = 'la_';
   var ICON = '<svg viewBox="0 0 24 24" width="24" height="24" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v5l4 2" fill="none" stroke="currentColor" stroke-width="2"/></svg>';
@@ -18,8 +18,8 @@
     { id: 0, title: 'Воскресенье' }
   ];
 
-  if (window.__lampaAlarm051Loaded) return;
-  window.__lampaAlarm051Loaded = true;
+  if (window.__lampaAlarm060Loaded) return;
+  window.__lampaAlarm060Loaded = true;
 
   // Best-effort wake detection: this cannot identify the TV power-on reason.
   // Unknown/unobserved wake never triggers a wake-guarded alarm.
@@ -436,25 +436,285 @@
     return key.toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 64);
   }
 
-  function matchPlayback(data, selected) {
-    if (!data || !selected) return null;
 
+  // Avoid mistaking a trailer or another show's stream for the selected series.
+  // Context can establish the card only when a matching playback screen is active.
+  var lastFullCard = null;
+  var lastOnlineContext = null;
+  var playerCreateContext = null;
+
+  function plainLabel(value, maxLength) {
+    if (typeof value !== 'string' && typeof value !== 'number') return '';
+    var str = String(value).replace(/<[^>]*>/g, '').trim();
+    if (!str || /(?:https?:\/\/|magnet:|bearer\s|(?:^|[?&])(?:token|key|auth)=|[?&][a-z_]+=)/i.test(str))
+      return '';
+    return str.replace(/[\r\n\t]/g, ' ').replace(/\s+/g, ' ').slice(0, maxLength || 120);
+  }
+
+  function numberOrNull(value) {
+    if (value === null || typeof value === 'undefined' || value === '') return null;
+    var n = Number(value);
+    return isFinite(n) && n >= 1 && n <= 9999 && n === Math.floor(n) ? n : null;
+  }
+
+  function extractEpisodeFromTitle(value) {
+    var s = plainLabel(value, 240);
+    if (!s) return { season: null, episode: null, method: '' };
+    var matches, a=null, b=null;
+    // Common "S02E03", "S2.E3", "Season 2 Episode 3" and "2x03".
+    matches = /(?:^|[^a-z0-9])s(?:eason)?\s*0*(\d{1,2})[\s._:/-]*e(?:p(?:isode)?)?\s*0*(\d{1,3})(?!\d)/i.exec(s);
+    if (matches) { a=numberOrNull(matches[1]);b=numberOrNull(matches[2]); }
+    if (!a || !b) {
+      matches = /(?:^|[^a-z0-9])0*(\d{1,2})\s*x\s*0*(\d{1,3})(?!\d)/i.exec(s);
+      if (matches) { a=numberOrNull(matches[1]);b=numberOrNull(matches[2]); }
+    }
+    // "S1 / Серия 5", "Сезон 2 / Серия 9", "Season 1 / Episode 3".
+    if (!a || !b) {
+      matches = /(?:сезон(?:а|е)?|season|s)\s*№?\s*0*(\d{1,2})[\s\S]{0,32}?(?:сер(?:ия|ии|ию)|эпизод|episode|ep\.?)\s*№?\s*0*(\d{1,3})(?!\d)/i.exec(s);
+      if (matches) { a=numberOrNull(matches[1]);b=numberOrNull(matches[2]); }
+    }
+    // "2 сезон 5 серия" (season index appears before Russian label).
+    if (!a || !b) {
+      matches = /(?:^|[^\d])0*(\d{1,2})\s*(?:-?(?:й|ый|го))?\s*сезон[\s\S]{0,32}?(?:сер(?:ия|ии|ию)|эпизод)\s*№?\s*0*(\d{1,3})(?!\d)/i.exec(s);
+      if(matches){a=numberOrNull(matches[1]);b=numberOrNull(matches[2]);}
+    }
+    if (!a || !b) {
+      // We may safely identify an episode without assuming a season.
+      matches = /(?:сер(?:ия|ии|ию)|эпизод|episode|ep\.?)\s*№?\s*0*(\d{1,3})(?!\d)/i.exec(s);
+      if (matches) b=numberOrNull(matches[1]);
+      matches = /(?:сезон(?:а|е)?|season)\s*№?\s*0*(\d{1,2})(?!\d)/i.exec(s);
+      if (matches) a=numberOrNull(matches[1]);
+    }
+    return { season: a, episode: b, method: a && b ? 'название' : b ? 'частично из названия' : '' };
+  }
+
+  function episodeMetadata(data) {
+    var tl = data && data.timeline && typeof data.timeline === 'object' ? data.timeline : {};
+    var nested = [];
+    if (data) {
+      [data, tl, data.element, data.item, data.media, data.file, data.video].forEach(function(x) {
+        if (x && typeof x === 'object') nested.push(x);
+      });
+    }
+    var season=null,episode=null;
+    for (var i=0;i<nested.length;i++){
+      if (!season) season = numberOrNull(nested[i].season) || numberOrNull(nested[i].season_number);
+      if (!episode) episode = numberOrNull(nested[i].episode) || numberOrNull(nested[i].episode_number);
+    }
+    var method = season && episode ? 'метаданные плеера' : '';
+    var fields = [
+      data && data.title, data && data.fname, data && data.name,
+      data && data.episodeTitle, data && data.episode_title,
+      tl && tl.title, data && data.element && data.element.title,
+      data && data.item && data.item.title
+    ];
+    for(var j=0;j<fields.length;j++){
+      var parsed=extractEpisodeFromTitle(fields[j]);
+      if(!season && parsed.season) season=parsed.season;
+      if(!episode && parsed.episode) episode=parsed.episode;
+      if (season && episode) {
+        if(!method)method='метаданные + ' + (parsed.method || 'название');
+        break;
+      }
+    }
+    return { season:season, episode:episode, method:method ||
+      (season || episode ? 'частично' : 'не определены') };
+  }
+
+  function sourceComponentIsOnline(component) {
+    return /(?:online|vod|rezka|filmix|collaps|kinobase|lumex|bwa|showy|modss|stream|serials)/i.test(component);
+  }
+
+  function getCardFromActivity(activity) {
+    if (!activity || typeof activity !== 'object') return null;
+    return activity.movie || activity.card ||
+      (activity.data && (activity.data.movie || activity.data.card)) ||
+      (activity.object && (activity.object.movie || activity.object.card)) || null;
+  }
+
+  function activitySnapshot(activity, selected, allowRecentFull) {
+    if (!activity || !selected) return null;
+    var component=plainLabel(activity.component || '',100);
+    if (!component || /^(full|main|settings|player|youtube|trailer)$/i.test(component))
+      return null;
+    var card=getCardFromActivity(activity);
+    if (card && (card.id || card.tmdb_id)) {
+      if (!isSameCard(card,selected)) return null;
+      return { at:Date.now(),component:component,
+        title:plainLabel(activity.title || '',100), method:'активный экран',
+        selectedId:selected.id, selectedSource:selected.source };
+    }
+    if (allowRecentFull && sourceComponentIsOnline(component) &&
+        lastFullCard && lastFullCard.selectedId===selected.id &&
+        lastFullCard.selectedSource===selected.source &&
+        Date.now()-lastFullCard.at<=120000) {
+      return {at:Date.now(),component:component,
+        title:plainLabel(activity.title || '',100),
+        method:'онлайн-экран после карточки',selectedId:selected.id,
+        selectedSource:selected.source};
+    }
+    return null;
+  }
+
+  function detectActivityContext(selected) {
+    try {
+      if (!Lampa.Activity || typeof Lampa.Activity.active !== 'function') return null;
+      return activitySnapshot(Lampa.Activity.active(), selected, true);
+    } catch (e) { return null; }
+  }
+
+  function contextForPlayback(selected) {
+    var active=detectActivityContext(selected);
+    if (active) {
+      lastOnlineContext=active;
+      return active;
+    }
+    if (playerCreateContext && Date.now()-playerCreateContext.at<=120000 &&
+        playerCreateContext.selectedId===selected.id &&
+        playerCreateContext.selectedSource===selected.source) return playerCreateContext;
+    if (lastOnlineContext && Date.now()-lastOnlineContext.at<=30000 &&
+        lastOnlineContext.selectedId===selected.id &&
+        lastOnlineContext.selectedSource===selected.source) return lastOnlineContext;
+    return null;
+  }
+
+  function watchFullCard(e) {
+    try {
+      if (e && e.type==='complite' && e.data && e.data.movie) {
+        var card=e.data.movie;
+        var chosen=selectedSeries();
+        lastFullCard=chosen && isSameCard(card,chosen) ?
+          {at:Date.now(),selectedId:chosen.id,selectedSource:chosen.source} : null;
+      }
+    } catch(e){}
+    addSeriesButton(e);
+  }
+
+  function onPlayerCreate(event) {
+    playerCreateContext=null;
+    if (!event || !event.data) return;
+    var chosen=selectedSeries();
+    if (!chosen) return;
+    var active=detectActivityContext(chosen);
+    if(active) playerCreateContext=active;
+  }
+
+  function safeStorageGet(key, otherwise) {
+    try { return Lampa.Storage.get(key, otherwise); } catch(e){return otherwise;}
+  }
+
+  function providerForPlayback(data, context, selected, isTorrent) {
+    if (isTorrent) return {
+      provider:'TorrServer', component:'torrent', balancer:'',
+      voice:'', quality:'', sourceMethod:'плеер'
+    };
+    var component=context ? context.component : '';
+    var provider=component === 'online_mod' ? 'AT Anton Online Mod' :
+      component === 'online' ? 'Lampa Online' :
+      component === 'online_prestige' ? 'Lampa Online Prestige' :
+      component ? component : 'Онлайн-плагин не определён';
+    var explicit=plainLabel(data && (data.balanser || data.balancer ||
+      data.provider || data.provider_name || data.service),80);
+    var balancer=explicit;
+    var voice=plainLabel(data && (data.voice_name || data.translate_voice ||
+      data.voice || data.translation_name),100);
+    var quality=plainLabel(data && (data.quality_name ||
+      data.quality_selected || data.quality_switched),30);
+    var sourceMethod=explicit ? 'плеер' : component ? 'текущий экран' : 'не определён';
+
+    if(component==='online_mod'){
+      var history=safeStorageGet('online_mod_last_balanser',{});
+      var preferred=history && typeof history==='object' &&
+        history[selected.id] || safeStorageGet('online_mod_balanser','');
+      if (!balancer) balancer=plainLabel(preferred,70);
+      var choices=safeStorageGet('online_mod_choice_'+preferred,{});
+      var selection=choices && typeof choices==='object' ? choices[selected.id] : null;
+      if (!voice && selection) voice=plainLabel(selection.voice_name,100);
+    }
+    else if(component==='online' || component==='online_prestige'){
+      var last=safeStorageGet('online_last_balanser',{});
+      if (!balancer) balancer=plainLabel((last&&last[selected.id]) ||
+        safeStorageGet('online_balanser',''),70);
+      var selectedB=balancer;
+      var opts=safeStorageGet('online_choice_'+selectedB,{});
+      var chosen=opts && typeof opts==='object' ? opts[selected.id] : null;
+      if(!voice && chosen) voice=plainLabel(chosen.voice_name,100);
+    }
+    if(!quality && typeof (data && data.quality)==='string') 
+      quality=plainLabel(data.quality,30);
+    return {provider:provider,component:component,balancer:balancer,
+      voice:voice,quality:quality,sourceMethod:sourceMethod};
+  }
+
+  function playbackHistory() {
+    var saved=safeStorageGet(PREFIX + 'playback_history', []);
+    if (!Array.isArray(saved)) return [];
+    return saved.filter(function(x){return x && typeof x==='object' && x.seriesId;}).slice(0,60);
+  }
+
+  function saveHistory(item) {
+    if (!item || !item.seriesId) return;
+    // All fields below are intentionally plain metadata, never stream URLs or tokens.
+    var obj={
+      seriesId:String(item.seriesId),
+      title:plainLabel(item.title,180),
+      source:plainLabel(item.source,40),
+      sourceType:item.sourceType==='torrent'?'torrent':'online',
+      playerMode:item.playerMode==='external'?'external':'internal',
+      season:numberOrNull(item.season),episode:numberOrNull(item.episode),
+      episodeTitle:plainLabel(item.episodeTitle,180),
+      provider:plainLabel(item.provider,90),
+      providerComponent:plainLabel(item.providerComponent,90),
+      balancer:plainLabel(item.balancer,90),
+      voice:plainLabel(item.voice,100),
+      quality:plainLabel(item.quality,30),
+      matchMethod:plainLabel(item.matchMethod,80),
+      episodeMethod:plainLabel(item.episodeMethod,80),
+      positionSeconds:Number(item.positionSeconds)||0,
+      durationSeconds:Number(item.durationSeconds)||0,
+      ended:Boolean(item.ended),capturedAt:item.capturedAt
+    };
+    var history=playbackHistory();
+    // Last record is updated on progress events rather than duplicated.
+    var marker=[obj.seriesId,obj.source,obj.providerComponent,obj.balancer,
+      obj.season,obj.episode,obj.episodeTitle].join('|');
+    for (var i=history.length-1;i>=0;i--){
+      var other=history[i];
+      var candidate=[other.seriesId,other.source,other.providerComponent,
+        other.balancer,other.season,other.episode,other.episodeTitle].join('|');
+      if(candidate===marker){history.splice(i,1);}
+    }
+    history.unshift(obj);
+    save('playback_history',history.slice(0,60));
+  }
+
+  function setCaptureDiagnostic(message, context) {
+    var item={at:new Date().toISOString(),
+      status:plainLabel(message,190),
+      component:context ? plainLabel(context.component,80) : ''};
+    save('capture_diagnostic',item);
+  }
+
+  function captureDiagnostic() {
+    var obj=safeStorageGet(PREFIX + 'capture_diagnostic',null);
+    return obj && typeof obj==='object' ? obj : null;
+  }
+
+  function matchPlayback(data, selected, context) {
+    if (!data || !selected) return null;
     if (data.card && isSameCard(data.card, selected)) return 'card';
     if (data.movie && isSameCard(data.movie, selected)) return 'movie';
-    // If the player explicitly identifies a different card, never
-    // fall back to the current screen or match by title.
-    if ((data.card && data.card.id) || (data.movie && data.movie.id)) return null;
+    // Explicit different IDs must never be overwritten by UI context.
+    if ((data.card && (data.card.id || data.card.tmdb_id)) ||
+        (data.movie && (data.movie.id || data.movie.tmdb_id))) return null;
 
     var timeline = data.timeline;
     if (timeline && typeof timeline === 'object' &&
         timeline.card && String(timeline.card) === timelineKeyForSeries(selected))
       return 'timeline';
-
     if (timeline && timeline.card) return null;
-
-    // Only use Activity metadata on a recognized media-list screen.
-    // Even then, this is just a diagnostic observation, not proof that the
-    // stream belongs to the series, so do not use it for a persisted match.
+    if (context && context.selectedId===selected.id &&
+        context.selectedSource===selected.source) return context.method;
     return null;
   }
 
@@ -465,51 +725,78 @@
 
   function capturePlayback(data, mode) {
     try {
-      if (!enabled('capture_playback', true)) return null;
-      var selected = selectedSeries();
-      var match = matchPlayback(data, selected);
-      if (!match) {
-        currentPlayback = null;
+      if (!enabled('capture_playback',true)) return null;
+      var selected=selectedSeries();
+      if (!selected) return null;
+      var context=contextForPlayback(selected);
+      var match=matchPlayback(data,selected,context);
+      if(!match) {
+        setCaptureDiagnostic('Видео не сопоставлено с выбранным сериалом',context);
+        currentPlayback=null;
         return null;
       }
 
-      var tl = data.timeline && typeof data.timeline === 'object' ?
-        data.timeline : {};
-      var series = {
-        seriesId: selected.id,
-        title: selected.title,
-        source: selected.source,
-        sourceType: data.torrent_hash ? 'torrent' : 'online',
-        playerMode: mode,
-        matchMethod: match,
-        season: episodeNumber(tl.season || data.season),
-        episode: episodeNumber(tl.episode || data.episode),
-        episodeTitle: String(data.title || '').slice(0, 200),
-        positionSeconds: Number(tl.time) > 0 ? Math.round(Number(tl.time)) : 0,
-        durationSeconds: Number(tl.duration) > 0 ? Math.round(Number(tl.duration)) : 0,
-        ended: false,
-        capturedAt: new Date().toISOString()
-      };
-
-      currentPlayback = series;
-      save('last_playback', series);
-      if (series.sourceType === 'torrent') {
-        saveTorrentIdentity(data, selected, series);
-        sessionOnline = null;
-      } else if (mode === 'internal' && typeof data.url === 'string' &&
-                 /^https?:\/\//i.test(data.url)) {
-        sessionOnline = {
-          seriesId: selected.id,
-          source: selected.source,
-          at: Date.now(),
-          data: data // memory only; never written to Storage or logs
-        };
+      var tl=data.timeline && typeof data.timeline==='object'?data.timeline:{};
+      var metadata=episodeMetadata(data);
+      var isTorrent=Boolean(data.torrent_hash ||
+        parseTorrentStreamUrl(data.url).hash);
+      var provider=providerForPlayback(data,context,selected,isTorrent);
+      var old=lastPlayback();
+      // Preserve richer data across the internal-start / Android-external
+      // pair for the same episode (the second event may omit metadata).
+      var sameRecent=old && old.seriesId===selected.id &&
+        old.source===selected.source &&
+        old.sourceType===(isTorrent?'torrent':'online') &&
+        Date.now()-Date.parse(old.capturedAt||0)<120000;
+      if(sameRecent && !metadata.season) metadata.season=numberOrNull(old.season);
+      if(sameRecent && !metadata.episode) metadata.episode=numberOrNull(old.episode);
+      if (sameRecent && !provider.component) {
+        provider.component=old.providerComponent || '';
+        provider.provider=old.provider || provider.provider;
+        provider.balancer=old.balancer || provider.balancer;
+        provider.voice=old.voice || provider.voice;
       }
-      log('Captured ' + series.sourceType + ' playback, match=' + match +
-          ', season=' + series.season + ', episode=' + series.episode);
+
+      var series={
+        seriesId:selected.id,title:selected.title,source:selected.source,
+        sourceType:isTorrent?'torrent':'online',playerMode:mode,
+        matchMethod:match,episodeMethod:metadata.method,
+        season:metadata.season,episode:metadata.episode,
+        episodeTitle:plainLabel(data.title||data.fname||data.name||'',180),
+        provider:provider.provider,
+        providerComponent:provider.component,
+        balancer:provider.balancer,
+        voice:provider.voice,
+        quality:provider.quality,
+        sourceMethod:provider.sourceMethod,
+        positionSeconds:Number(tl.time)>0?Math.round(Number(tl.time)):0,
+        durationSeconds:Number(tl.duration)>0?Math.round(Number(tl.duration)):0,
+        ended:false,capturedAt:new Date().toISOString()
+      };
+      currentPlayback=series;
+      save('last_playback',series);
+      saveHistory(series);
+      setCaptureDiagnostic(series.episode ?
+        'Серия определена: '+(series.season?'S'+series.season+' ':'')+
+          'E'+series.episode+'; '+series.provider+
+          (series.balancer?' / '+series.balancer:'') :
+        'Сериал распознан, но плеер не передал номер серии',context);
+
+      if(isTorrent){
+        saveTorrentIdentity(data,selected,series);
+        sessionOnline=null;
+      } else if(mode==='internal' && typeof data.url==='string' &&
+          /^https?:\/\//i.test(data.url)) {
+        // URL is only in RAM and cannot survive restarting Lampa.
+        sessionOnline={seriesId:selected.id,source:selected.source,
+          at:Date.now(),data:data};
+      }
+      log('Captured: '+series.sourceType+' / '+match+
+        ' / '+series.provider+' / S'+series.season+'E'+series.episode);
       return series;
-    } catch (e) {
-      log('Capture playback error: ' + e.message);
+    } catch(e){
+      log('Capture error: '+e.message);
+      setCaptureDiagnostic('Ошибка распознавания: '+e.message,null);
       return null;
     }
   }
@@ -543,6 +830,7 @@
       if (now - lastProgressWrite >= 30000) {
         lastProgressWrite = now;
         save('last_playback', currentPlayback);
+        saveHistory(currentPlayback);
       }
     };
     var ended = function () {
@@ -550,6 +838,7 @@
       currentPlayback.ended = true;
       currentPlayback.positionSeconds = currentPlayback.durationSeconds;
       save('last_playback', currentPlayback);
+      saveHistory(currentPlayback);
     };
     try {
       Lampa.PlayerVideo.listener.follow('timeupdate', progress);
@@ -564,23 +853,73 @@
   }
 
   function onPlayerDestroy() {
-    if (currentPlayback && currentPlayback.playerMode === 'internal')
+    if (currentPlayback && currentPlayback.playerMode === 'internal') {
       save('last_playback', currentPlayback);
+      saveHistory(currentPlayback);
+    }
     currentPlayback = null;
+    playerCreateContext=null;
     clearVideoHandlers();
   }
 
   function formatPlayback(item) {
     if (!item) return 'Данных нет. Выбери сериал и запусти его обычным способом.';
-    var episode = item.season && item.episode ?
-      ' — сезон ' + item.season + ', серия ' + item.episode : ' — номер серии не определён';
-    var source = item.sourceType === 'torrent' ? 'TorrServer' : 'Онлайн';
-    var player = item.playerMode === 'external' ? 'внешний плеер' : 'плеер Lampa';
-    return item.title + episode + '. ' + source + ', ' + player + '.';
+    var episode = item.episode ?
+      ' — S' + (item.season || '?') + 'E' + item.episode :
+      ' — серия не определена';
+    var source=item.sourceType==='torrent'?'TorrServer':
+      (item.provider||'Онлайн');
+    if(item.balancer)source+=' / '+item.balancer;
+    return plainLabel(item.title,70)+episode+'; '+source+
+      (item.voice?'; озвучка: '+item.voice:'')+'.';
+  }
+
+  function sourceDetails() {
+    var item=lastPlayback();
+    if(!item){notice('Пока нет просмотренной серии');return;}
+    notice('Плагин: '+(item.provider || 'неизвестно')+
+      '; балансер: '+(item.balancer||'неизвестен')+
+      '; озвучка: '+(item.voice||'не определена'));
+    notice('Источник определения: '+(item.matchMethod||'неизвестен')+
+      '; серия: '+(item.episodeMethod||'не определена'));
+  }
+
+  function showHistory() {
+    var items=playbackHistory();
+    if(!items.length)return notice('История будильника пока пустая');
+    if (Lampa.Select && typeof Lampa.Select.show==='function' &&
+        Lampa.Controller && Lampa.Controller.enabled &&
+        Lampa.Controller.toggle) {
+      try{
+        var controller=Lampa.Controller.enabled();
+        var name=controller&&controller.name||'settings_component';
+        Lampa.Select.show({
+          title:'История просмотров для будильника',
+          items:items.slice(0,30).map(function(x){
+            return {title:formatPlayback(x),subtitle:x.capturedAt||'',record:x};
+          }),
+          onSelect:function(choice){
+            Lampa.Controller.toggle(name);
+            if(choice&&choice.record)notice(formatPlayback(choice.record));
+          },
+          onBack:function(){Lampa.Controller.toggle(name);}
+        });
+        return;
+      }catch(e){log('History menu error: '+e.message);}
+    }
+    notice(items.slice(0,2).map(formatPlayback).join(' | '));
+  }
+
+  function captureDebugMessage() {
+    var d=captureDiagnostic();
+    if(!d)return 'Ещё нет диагностических событий. Запусти выбранный сериал.';
+    return d.status+(d.component?' [экран '+d.component+']':'');
   }
 
   function clearLastPlayback() {
     save('last_playback', '');
+    save('playback_history', []);
+    save('capture_diagnostic', '');
     currentPlayback = null;
     notice('Будильник: история тестового воспроизведения очищена');
   }
@@ -819,6 +1158,8 @@
       lastWakeInfo: String(read('last_wake_info', 'не обнаружено')),
       selectedSeries: selectedSeries(),
       lastPlayback: lastPlayback(),
+      historyCount: playbackHistory().length,
+      captureDiagnostic: captureDiagnostic(),
       torrentBookmark: torrentBookmark() ?
         { season: torrentBookmark().season, episode: torrentBookmark().episode,
           fileIndex: torrentBookmark().fileIndex, savedAt: torrentBookmark().savedAt } : null,
@@ -946,6 +1287,15 @@
     addParam('playback_info', 'button', 'Последняя просмотренная серия',
       'Показать обнаруженную серию выбранного сериала.', '', null,
       function () { notice(formatPlayback(lastPlayback())); });
+    addParam('playback_source', 'button', 'Источник и озвучка последней серии',
+      'Показывает плагин, балансер и происхождение данных.', '', null,
+      sourceDetails);
+    addParam('playback_history', 'button', 'История просмотров будильника',
+      'До 60 последних записей с номерами серий и источниками.', '', null,
+      showHistory);
+    addParam('playback_debug', 'button', 'Диагностика распознавания серии',
+      'Показывает, что удалось распознать, без ссылок и токенов.', '', null,
+      function(){notice(captureDebugMessage());});
     addParam('playback_clear', 'button', 'Очистить историю будильника',
       'Удалить запись о последней серии, не затрагивая историю Lampa.', '', null,
       clearLastPlayback);
@@ -994,7 +1344,7 @@
     addParam('test', 'button', 'Проверить уведомление',
       'Покажет тестовое уведомление. Видео не запустится, громкость не изменится.', '', null,
       function () {
-        notice('Lampa Alarm 0.5.1: тест пройден, настройки доступны.');
+        notice('Lampa Alarm 0.6.0: тест пройден, настройки доступны.');
         log('Manual test performed');
       });
     addParam('status', 'button', 'Показать текущие настройки',
@@ -1015,7 +1365,7 @@
       setupSettings();
     } catch (e) {
       log('Setup failed: ' + e.message);
-      notice('Lampa Alarm 0.5.1: ошибка регистрации настроек');
+      notice('Lampa Alarm 0.6.0: ошибка регистрации настроек');
     }
     // Let the native Settings.main().update() build the menu entry and bind
     // the built-in hover:enter handler. Never append a data-static fallback.
@@ -1027,13 +1377,22 @@
     // Only TV-series cards receive the alarm button.
     try {
       if (Lampa.Listener && typeof Lampa.Listener.follow === 'function')
-        Lampa.Listener.follow('full', addSeriesButton);
+        Lampa.Listener.follow('full', watchFullCard);
+      if (Lampa.Listener && typeof Lampa.Listener.follow==='function')
+        Lampa.Listener.follow('activity', function(e){
+          if (!e || (e.type!=='start' && e.type!=='create')) return;
+          var selected=selectedSeries();
+          if (!selected) return;
+          var ctx=activitySnapshot(e.object,selected,true);
+          if(ctx)lastOnlineContext=ctx;
+        });
       if (Lampa.Listener && typeof Lampa.Listener.follow === 'function')
         Lampa.Listener.follow('torrent_file', onTorrentFileEvent);
     } catch (e) { log('Card listener failed: ' + e.message); }
     try {
       if (Lampa.Player && Lampa.Player.listener &&
           typeof Lampa.Player.listener.follow === 'function') {
+        Lampa.Player.listener.follow('create', onPlayerCreate);
         Lampa.Player.listener.follow('start', onPlayerStart);
         Lampa.Player.listener.follow('external', onPlayerExternal);
         Lampa.Player.listener.follow('destroy', onPlayerDestroy);
@@ -1058,6 +1417,9 @@
       getConfig: settingsSnapshot,
       getSelectedSeries: selectedSeries,
       getLastPlayback: lastPlayback,
+      getPlaybackHistory: playbackHistory,
+      getCaptureDiagnostic: captureDiagnostic,
+      testEpisodeParser: extractEpisodeFromTitle,
       getTestStatus: function () {
         return { armed: enabled('startup_test_enabled', false),
           hasTorrentBookmark: canLaunchTorrent() };
@@ -1075,7 +1437,7 @@
         } : null;
       },
       check: checkSchedule,
-      test: function () { notice('Lampa Alarm 0.5.1: тест пройден.'); }
+      test: function () { notice('Lampa Alarm 0.6.0: тест пройден.'); }
     };
     log('Initialized');
   }
