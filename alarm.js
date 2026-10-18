@@ -1,9 +1,9 @@
 (function () {
   'use strict';
 
-  // Lampa Alarm v0.6.2: one-shot startup test and manual TorrServer replay.
+  // Lampa Alarm v0.7.0: one-shot startup test and manual TorrServer replay.
   // Scheduled playback and Android system-volume control are still disabled.
-  var VERSION = '0.6.2';
+  var VERSION = '0.7.0';
   var COMPONENT = 'lampa_alarm';
   var PREFIX = 'la_';
   var ICON = '<svg viewBox="0 0 24 24" width="24" height="24" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v5l4 2" fill="none" stroke="currentColor" stroke-width="2"/></svg>';
@@ -18,8 +18,8 @@
     { id: 0, title: 'Воскресенье' }
   ];
 
-  if (window.__lampaAlarm062Loaded) return;
-  window.__lampaAlarm062Loaded = true;
+  if (window.__lampaAlarm070Loaded) return;
+  window.__lampaAlarm070Loaded = true;
 
   // Best-effort wake detection: this cannot identify the TV power-on reason.
   // Unknown/unobserved wake never triggers a wake-guarded alarm.
@@ -34,6 +34,7 @@
   var sessionOnline = null;
   var ONLINE_TTL_MS = 120000;
   var torrentLaunch = null;
+  var onlineRoute = null;
 
   function markInteraction() { lastInteractionAt = Date.now(); }
 
@@ -658,6 +659,7 @@
       }
     } catch(e){}
     addSeriesButton(e);
+    openOnlinePluginFromCard(onlineRoute,e);
   }
 
   function onPlayerCreate(event) {
@@ -893,6 +895,7 @@
   function onPlayerStart(data) {
     clearVideoHandlers();
     onLaunchPlayerStart(data);
+    onOnlinePlayerStart(data);
     var observation = capturePlayback(data, 'internal');
     if (!observation || !Lampa.PlayerVideo || !Lampa.PlayerVideo.listener) return;
 
@@ -928,12 +931,14 @@
 
   function onPlayerExternal(data) {
     onLaunchExternalPlayer(data);
+    onOnlinePlayerExternal(data);
     clearVideoHandlers();
     capturePlayback(data, 'external');
   }
 
   function onPlayerDestroy() {
     onLaunchPlayerDestroy();
+    onOnlinePlayerDestroy();
     if (currentPlayback && currentPlayback.playerMode === 'internal') {
       save('last_playback', currentPlayback);
       saveHistory(currentPlayback);
@@ -1403,6 +1408,414 @@
     }
   }
 
+
+  // Online replay uses the installed plugin's OWN episode selection button.
+  // It must not try to reuse saved stream URLs after restarting Lampa.
+  function onlineReplayCandidate(){
+    var selected=selectedSeries();
+    if(!selected)return null;
+    var history=playbackHistory();
+    var recent=lastPlayback();
+    if(recent && recent.sourceType==='online')history.unshift(recent);
+    for(var i=0;i<history.length;i++){
+      var row=history[i];
+      if(row && row.sourceType==='online' &&
+         String(row.seriesId)===selected.id &&
+         String(row.source)===selected.source){
+        var component=plainLabel(row.providerComponent,50);
+        return {
+          id:selected.id,source:selected.source,title:selected.title,
+          originalTitle:selected.originalTitle,
+          component:component,provider:plainLabel(row.provider,100),
+          balancer:plainLabel(row.balancer,70),
+          voice:plainLabel(row.voice,90),
+          season:numberOrNull(row.season),episode:numberOrNull(row.episode),
+          capturedAt:row.capturedAt||''
+        };
+      }
+    }
+    return null;
+  }
+
+  function onlineComponentSupported(component){
+    return component==='online_mod' ||
+      component==='online' || component==='online_prestige';
+  }
+
+  function onlineStatus(){
+    var data=storedValue('online_launch_status',null);
+    return data && typeof data==='object' ? data : null;
+  }
+
+  function onlineStatusText(){
+    var state=onlineStatus();
+    if(!state)return 'Онлайн: тест повторного открытия ещё не запускался';
+    return 'Онлайн: '+state.message+'; прошло '+state.elapsedSeconds+' с';
+  }
+
+  function onlineRecordState(job, stage, message) {
+    if(!job || job!==onlineRoute || job.finished)return;
+    var stageChanged=job.stage!==stage;
+    job.stage=stage;
+    var now=Date.now();
+    var status={
+      stage:stage,message:plainLabel(message,190),
+      elapsedSeconds:Math.max(0,Math.round((now-job.startedAt)/1000)),
+      provider:plainLabel(job.route.provider,90),
+      component:job.route.component,
+      balancer:plainLabel(job.route.balancer,70),
+      season:job.route.season,episode:job.route.episode,
+      updatedAt:new Date(now).toISOString()
+    };
+    if(stageChanged || now-job.lastSaveAt>=4000) {
+      job.lastSaveAt=now;
+      save('online_launch_status',status);
+    }
+    if(stageChanged) notice('Онлайн: '+status.message);
+  }
+
+  function onlineTimer(job, callback, delay){
+    if(job.finished || job!==onlineRoute)return null;
+    var id=setTimeout(function(){
+      var i=job.timers.indexOf(id);
+      if(i>=0)job.timers.splice(i,1);
+      if(job.finished || job!==onlineRoute)return;
+      callback();
+    },delay);
+    job.timers.push(id);
+    return id;
+  }
+
+  function detachOnlineVideo(job){
+    if(!job || !job.videoCallbacks ||
+       !Lampa.PlayerVideo || !Lampa.PlayerVideo.listener)return;
+    var bus=Lampa.PlayerVideo.listener;
+    var handlers=job.videoCallbacks;
+    try{
+      bus.remove('timeupdate',handlers.timeupdate);
+      bus.remove('error',handlers.error);
+    }catch(e){}
+    job.videoCallbacks=null;
+  }
+
+  function onlineFinish(job,stage,message){
+    if(!job || job!==onlineRoute || job.finished)return;
+    onlineRecordState(job,stage,message);
+    job.finished=true;
+    job.timers.forEach(function(id){clearTimeout(id)});
+    job.timers=[];
+    detachOnlineVideo(job);
+  }
+
+  function cancelOnlineRoute(){
+    if(onlineRoute && !onlineRoute.finished)
+      onlineFinish(onlineRoute,'cancelled','Тест онлайн-воспроизведения отменён');
+    else notice('Онлайн: нет активного теста');
+  }
+
+  function prepareOnlineBalancer(job){
+    var route=job.route;
+    if(!/^[a-z][a-z0-9_-]{0,48}$/i.test(route.balancer||''))return;
+    try{
+      var key,historyKey;
+      if(route.component==='online_mod'){
+        key='online_mod_balanser';
+        historyKey='online_mod_last_balanser';
+      }else if(route.component==='online' ||
+               route.component==='online_prestige'){
+        key='online_balanser';
+        historyKey='online_last_balanser';
+      }else return;
+      // Reapply the user's previously used balancer for this series.
+      // The original plugin still selects its own voice/quality preferences.
+      Lampa.Storage.set(key,route.balancer);
+      var map=safeStorageGet(historyKey,{});
+      if(!map || typeof map!=='object'||Array.isArray(map))map={};
+      map[job.series.id]=route.balancer;
+      Lampa.Storage.set(historyKey,map);
+    }catch(e){log('Restore online balancer failed: '+e.message);}
+  }
+
+  function onlineActivityMatches(job,activity){
+    if(!job || !activity || activity.component!==job.route.component)return false;
+    var card=getCardFromActivity(activity);
+    return Boolean(card && isSameCard(card,job.series));
+  }
+
+  function onOnlineListReady(job,activity){
+    if(job.finished || job!==onlineRoute)return;
+    if(!onlineActivityMatches(job,activity)){
+      onlineFinish(job,'failed','Сторонний плагин открыл другую карточку');
+      return;
+    }
+    if(!job.auto){
+      onlineFinish(job,'opened',
+        'Экран источника открыт. Выбери серию вручную');
+      return;
+    }
+    if(!job.route.season || !job.route.episode){
+      onlineFinish(job,'manual',
+        'Сезон или серия не сохранены; выбирай эпизод вручную');
+      return;
+    }
+    onlineRecordState(job,'waiting_rows',
+      'Жду список эпизодов S'+job.route.season+'E'+job.route.episode);
+    onlineTimer(job,function(){onlineFindEpisodeRow(job)},800);
+  }
+
+  function findEpisodeCandidates(job,activity){
+    var result=[];
+    var root=activity.activity && typeof activity.activity.render==='function' ?
+      activity.activity.render() : null;
+    if(!root || typeof root.find!=='function')return result;
+    var list=root.find('.online.selector');
+    if(!list || typeof list.each!=='function')return result;
+    var count=0;
+    list.each(function(index,element){
+      if(count++>500)return;
+      try{
+        var item=$(element);
+        var titleNode=item.find('.online__title');
+        var title=titleNode && titleNode.length && titleNode.first ?
+          titleNode.first().text() : item.text();
+        var parsed=extractEpisodeFromTitle(title);
+        if(parsed.season===job.route.season &&
+           parsed.episode===job.route.episode){
+          var infoNode=item.find('.online__quality');
+          var info=infoNode && infoNode.length ? infoNode.text() : '';
+          result.push({item:item,title:plainLabel(title,170),
+            detail:plainLabel(info,180)});
+        }
+      }catch(e){log('Online row read error: '+e.message);}
+    });
+    return result;
+  }
+
+  function onlineFindEpisodeRow(job){
+    if(job.finished || job!==onlineRoute || job.stage!=='waiting_rows')return;
+    var activity;
+    try{activity=Lampa.Activity.active()}catch(e){}
+    if(!onlineActivityMatches(job,activity)){
+      onlineFinish(job,'cancelled','Экран онлайн-сериала закрыт или заменён');
+      return;
+    }
+    var rows=findEpisodeCandidates(job,activity);
+    if(rows.length){
+      var chosen=null;
+      if(rows.length===1)chosen=rows[0];
+      else if(job.route.voice){
+        var voice=job.route.voice.toLocaleLowerCase();
+        var exactVoice=rows.filter(function(row){
+          return row.detail.toLocaleLowerCase().indexOf(voice)>=0;
+        });
+        if(exactVoice.length===1)chosen=exactVoice[0];
+      }
+      if(!chosen){
+        onlineFinish(job,'manual',
+          'Найдено несколько вариантов серии; выбери нужную озвучку вручную');
+        return;
+      }
+      if(!chosen.item || typeof chosen.item.trigger!=='function'){
+        onlineFinish(job,'manual',
+          'Не удалось нажать на строку серии; выбери её вручную');
+        return;
+      }
+      try{
+        job.clicked=true;
+        onlineRecordState(job,'launching',
+          'Выбрана S'+job.route.season+'E'+job.route.episode+
+          ', ожидаю плеер');
+        chosen.item.trigger('hover:enter');
+      }catch(e){
+        log('Online row activation failed: '+e.message);
+        onlineFinish(job,'manual',
+          'Не удалось запустить строку плагина. Выбери серию вручную');
+      }
+      return;
+    }
+    onlineTimer(job,function(){onlineFindEpisodeRow(job)},1400);
+  }
+
+  function onOnlineActivityEvent(e){
+    var job=onlineRoute;
+    if(!job || job.finished || !e || e.type!=='start')return;
+    if(job.stage==='waiting_source' &&
+       onlineActivityMatches(job,e.object)){
+      onlineRecordState(job,'source_open','Источник открыт, загружаю эпизоды');
+      onlineTimer(job,function(){
+        if(job.finished)return;
+        onOnlineListReady(job,e.object);
+      },500);
+    }
+  }
+
+  function openOnlinePluginFromCard(job,event){
+    if(job.finished || job!==onlineRoute || job.stage!=='card_wait')return;
+    if(!event || event.type!=='complite'||!event.data ||
+       !event.data.movie||!isSameCard(event.data.movie,job.series))return;
+    onlineRecordState(job,'source_select','Ищу кнопку сохранённого онлайн-плагина');
+    onlineTimer(job,function(){
+      if(job.finished)return;
+      try{
+        var comp=job.route.component;
+        var root=event.object && event.object.activity &&
+          event.object.activity.render();
+        var selector=comp==='online_mod' ?
+          '.view--online_mod' : '.view--online';
+        var buttons=root && root.find ? root.find(selector) : null;
+        prepareOnlineBalancer(job);
+        // Normal Online and Prestige can share the same button CSS class.
+        // Never trigger an ambiguous button belonging to the wrong plugin.
+        var safeButton=buttons && buttons.length===1 &&
+          (comp!=='online_prestige'||!Lampa.Component ||
+            !Lampa.Component.get ||
+            !Lampa.Component.get('online'));
+        onlineRecordState(job,'waiting_source','Открываю сохранённый онлайн-источник');
+        if(safeButton && typeof buttons.first==='function'){
+          buttons.first().trigger('hover:enter');
+          return;
+        }
+        // Fallback: start only an explicitly registered component.
+        if(Lampa.Component && typeof Lampa.Component.get==='function' &&
+           Lampa.Component.get(comp) &&
+           Lampa.Activity && typeof Lampa.Activity.push==='function'){
+          var full=event.data.movie;
+          Lampa.Activity.push({
+            url:'',title:plainLabel(job.route.provider,100)||'Онлайн',
+            component:comp,search:full.title||full.name,
+            search_one:full.title||full.name,
+            search_two:full.original_title||full.original_name,
+            movie:full,page:1
+          });
+          return;
+        }
+        onlineFinish(job,'manual',
+          'Не удалось открыть плагин автоматически — выбери онлайн-кнопку в карточке');
+      }catch(e){
+        log('Open online provider error: '+e.message);
+        onlineFinish(job,'manual',
+          'Не удалось открыть источник автоматически. Выбери его вручную');
+      }
+    },250);
+  }
+
+  function isExpectedOnlinePlayback(job,data){
+    if(!job || job.finished || !job.clicked || !data)return false;
+    if(data.torrent_hash)return false;
+    var card=data.movie||data.card;
+    if(card && (card.id||card.tmdb_id) &&
+       !isSameCard(card,job.series))return false;
+    var tl=data.timeline;
+    if(tl && tl.card && String(tl.card)!==timelineKeyForSeries(job.series))
+      return false;
+    var episode=episodeMetadata(data);
+    if(episode.season && episode.season!==job.route.season)return false;
+    if(episode.episode && episode.episode!==job.route.episode)return false;
+    return true;
+  }
+
+  function onOnlinePlayerStart(data){
+    var job=onlineRoute;
+    if(!job || job.finished || job.stage!=='launching' ||
+       !isExpectedOnlinePlayback(job,data))return;
+    onlineRecordState(job,'player_wait','Плеер открыт, проверяю начало видео');
+    if(!Lampa.PlayerVideo || !Lampa.PlayerVideo.listener)return;
+    var bus=Lampa.PlayerVideo.listener;
+    detachOnlineVideo(job);
+    var cb={
+      timeupdate:function(event){
+        var pos=Number(event && event.current);
+        if(isFinite(pos)&&pos>0.1)
+          onlineFinish(job,'playing',
+            'Онлайн-видео воспроизводится. S'+job.route.season+
+            'E'+job.route.episode);
+      },
+      error:function(event){
+        if(event && event.fatal)
+          onlineFinish(job,'failed','Плеер сообщил об ошибке онлайн-видео');
+      }
+    };
+    job.videoCallbacks=cb;
+    try{
+      bus.follow('timeupdate',cb.timeupdate);
+      bus.follow('error',cb.error);
+    }catch(e){log('Online player observer failed: '+e.message);}
+  }
+
+  function onOnlinePlayerExternal(data){
+    var job=onlineRoute;
+    if(!job || job.finished || job.stage!=='launching' ||
+       !isExpectedOnlinePlayback(job,data))return;
+    onlineFinish(job,'external',
+      'Серия передана внешнему плееру; воспроизведение не подтверждено');
+  }
+
+  function onOnlinePlayerDestroy(){
+    var job=onlineRoute;
+    if(job && !job.finished &&
+       (job.stage==='launching'||job.stage==='player_wait'))
+      onlineFinish(job,'failed','Плеер закрыт до подтверждения воспроизведения');
+  }
+
+  function startOnlineReplay(automatic){
+    if(onlineRoute && !onlineRoute.finished){
+      notice('Онлайн: предыдущий тест ещё выполняется');return false;
+    }
+    if(torrentLaunch && !torrentLaunch.finished){
+      notice('Сначала заверши подготовку TorrServer');return false;
+    }
+    if(Lampa.Player && Lampa.Player.opened && Lampa.Player.opened()){
+      notice('Сначала закрой текущий видеоплеер');return false;
+    }
+    var selected=selectedSeries();
+    var route=onlineReplayCandidate();
+    if(!selected || !route){
+      notice('Нет сохранённого онлайн-просмотра для выбранного сериала');
+      return false;
+    }
+    if(!onlineComponentSupported(route.component)){
+      notice('Источник '+(route.provider||route.component)+
+        ' пока требует отдельного адаптера');
+      return false;
+    }
+    if(!Lampa.Activity || typeof Lampa.Activity.push!=='function'){
+      notice('Lampa не предоставляет доступ к открытию карточки');return false;
+    }
+    var job={
+      startedAt:Date.now(),lastSaveAt:0,stage:'',finished:false,
+      timers:[],series:selected,route:route,
+      auto:Boolean(automatic),clicked:false,videoCallbacks:null
+    };
+    onlineRoute=job;
+    onlineRecordState(job,'card_wait',
+      'Открываю карточку '+selected.title);
+    onlineTimer(job,function(){
+      onlineFinish(job,'failed',
+        'Источник не завершил загрузку за 120 секунд');
+    },120000);
+    try{
+      if(Lampa.Controller && typeof Lampa.Controller.toggle==='function')
+        Lampa.Controller.toggle('content');
+      Lampa.Activity.push({
+        url:'',title:selected.title,
+        component:'full',id:/^\d+$/.test(selected.id)?
+          Number(selected.id):selected.id,
+        source:selected.source,method:'tv',
+        card:{id:/^\d+$/.test(selected.id)?Number(selected.id):selected.id,
+          source:selected.source,name:selected.title,title:selected.title,
+          original_name:selected.originalTitle||selected.title,
+          original_title:selected.originalTitle||selected.title},
+        page:1
+      });
+      return true;
+    }catch(e){
+      log('Online card opening failed: '+e.message);
+      onlineFinish(job,'failed','Ошибка открытия карточки сериала');
+      return false;
+    }
+  }
+
+
   function armOneShotTest(value) {
     if (!(value === true || String(value) === 'true')) {
       save('startup_test_enabled', false);
@@ -1492,7 +1905,9 @@
           fileIndex: torrentBookmark().fileIndex, savedAt: torrentBookmark().savedAt } : null,
       startupTestEnabled: enabled('startup_test_enabled', false),
       torrentBookmarkStatus: bookmarkDiagnosticMessage(),
-      torrentLaunchStatus: launchReport()
+      torrentLaunchStatus: launchReport(),
+      onlineLaunchStatus: onlineStatus(),
+      onlineReplayCandidate: onlineReplayCandidate()
     };
   }
   function checkSchedule() {
@@ -1652,6 +2067,28 @@
       { '0': 'Сразу', '2': '2 минуты', '5': '5 минут', '10': '10 минут',
         '15': '15 минут', '20': '20 минут', '30': '30 минут' });
 
+    addTitle('Повтор онлайн-серии — тест');
+    addParam('online_route_info','button','Сохранённый онлайн-маршрут',
+      'Показывает плагин, балансер и последнюю серию без URL видео.',
+      '',null,function(){
+        var item=onlineReplayCandidate();
+        notice(item ? item.provider+' / '+(item.balancer||'неизвестный источник')+
+          ', S'+(item.season||'?')+'E'+(item.episode||'?') :
+          'Для выбранного сериала нет истории онлайн-просмотра');
+      });
+    addParam('online_open_source','button','Открыть сохранённый онлайн-источник',
+      'Открыть тот же плагин/балансер, но выбрать серию вручную.',
+      '',null,function(){startOnlineReplay(false)});
+    addParam('online_auto_episode','button','Тест выбора онлайн-серии',
+      'Заново открыть плагин и попробовать выбрать точно сохранённый эпизод.',
+      '',null,function(){startOnlineReplay(true)});
+    addParam('online_launch_info','button','Состояние онлайн-теста',
+      'Показывает текущий этап и результат. URL видео не сохраняется.',
+      '',null,function(){notice(onlineStatusText())});
+    addParam('online_launch_cancel','button','Отменить онлайн-тест',
+      'Прекратить автоматический поиск серии, оставив экран открытым.',
+      '',null,cancelOnlineRoute);
+
     addTitle('Подготовка TorrServer');
     addParam('torrent_wait_seconds','select','Максимальное ожидание видео',
       'Включает ожидание ответа TorrServer, предзагрузку и запуск плеера.',
@@ -1687,7 +2124,7 @@
     addParam('test', 'button', 'Проверить уведомление',
       'Покажет тестовое уведомление. Видео не запустится, громкость не изменится.', '', null,
       function () {
-        notice('Lampa Alarm 0.6.2: тест пройден, настройки доступны.');
+        notice('Lampa Alarm 0.7.0: тест пройден, настройки доступны.');
         log('Manual test performed');
       });
     addParam('status', 'button', 'Показать текущие настройки',
@@ -1708,7 +2145,7 @@
       setupSettings();
     } catch (e) {
       log('Setup failed: ' + e.message);
-      notice('Lampa Alarm 0.6.2: ошибка регистрации настроек');
+      notice('Lampa Alarm 0.7.0: ошибка регистрации настроек');
     }
     // Let the native Settings.main().update() build the menu entry and bind
     // the built-in hover:enter handler. Never append a data-static fallback.
@@ -1723,6 +2160,7 @@
         Lampa.Listener.follow('full', watchFullCard);
       if (Lampa.Listener && typeof Lampa.Listener.follow==='function')
         Lampa.Listener.follow('activity', function(e){
+          onOnlineActivityEvent(e);
           if (!e || (e.type!=='start' && e.type!=='create')) return;
           var selected=selectedSeries();
           if (!selected) return;
@@ -1774,6 +2212,11 @@
       },
       testTorrentPlayback: launchTorrentSeries,
       getTorrentLaunchStatus: launchReport,
+      getOnlineReplayCandidate: onlineReplayCandidate,
+      getOnlineLaunchStatus: onlineStatus,
+      testOnlineRoute: function(){return startOnlineReplay(true)},
+      openOnlineSource: function(){return startOnlineReplay(false)},
+      cancelOnlineRoute: cancelOnlineRoute,
       cancelTorrentLaunch: abortTorrentLaunch,
       testOnlinePlayback: launchOnlineSession,
       armStartupTest: armOneShotTest,
@@ -1787,7 +2230,7 @@
         } : null;
       },
       check: checkSchedule,
-      test: function () { notice('Lampa Alarm 0.6.2: тест пройден.'); }
+      test: function () { notice('Lampa Alarm 0.7.0: тест пройден.'); }
     };
     log('Initialized');
   }
