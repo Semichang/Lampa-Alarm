@@ -1,9 +1,9 @@
 (function () {
   'use strict';
 
-  // Lampa Alarm v0.2.2: settings and schedule notification only.
+  // Lampa Alarm v0.3.0: settings and schedule notification only.
   // This version intentionally does not start videos or change Android volume.
-  var VERSION = '0.2.2';
+  var VERSION = '0.3.0';
   var COMPONENT = 'lampa_alarm';
   var PREFIX = 'la_';
   var ICON = '<svg viewBox="0 0 24 24" width="24" height="24" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v5l4 2" fill="none" stroke="currentColor" stroke-width="2"/></svg>';
@@ -18,8 +18,8 @@
     { id: 0, title: 'Воскресенье' }
   ];
 
-  if (window.__lampaAlarm022Loaded) return;
-  window.__lampaAlarm022Loaded = true;
+  if (window.__lampaAlarm030Loaded) return;
+  window.__lampaAlarm030Loaded = true;
 
   // Best-effort wake detection: this cannot identify the TV power-on reason.
   // Unknown/unobserved wake never triggers a wake-guarded alarm.
@@ -116,6 +116,98 @@
     var match = /^([01][0-9]|2[0-3]):([0-5][0-9])$/.exec(String(value || ''));
     return match ? Number(match[1]) * 60 + Number(match[2]) : -1;
   }
+  // Saved card metadata, not a playback link. Streaming URLs are resolved later.
+  function selectedSeries() {
+    try {
+      var series = Lampa.Storage.get(PREFIX + 'selected_series', '');
+      if (!series || typeof series !== 'object') return null;
+      if (!series.id || !series.title || series.media !== 'tv') return null;
+      return {
+        id: String(series.id),
+        title: String(series.title),
+        originalTitle: String(series.originalTitle || ''),
+        source: String(series.source || 'tmdb'),
+        media: 'tv',
+        selectedAt: String(series.selectedAt || '')
+      };
+    } catch (e) { log('Selected series error: ' + e.message); return null; }
+  }
+
+  function clearSelectedSeries() {
+    save('selected_series', '');
+    notice('Lampa Alarm: выбранный сериал сброшен');
+  }
+
+  function buildSeriesFromCard(card) {
+    if (!card || typeof card !== 'object') return null;
+    // TMDB / CUB TV cards use name or first_air_date; films use title/release_date.
+    var isTv = Boolean(card.name || card.original_name || card.first_air_date ||
+      Number(card.number_of_seasons) > 0);
+    var id = card.id || card.tmdb_id;
+    var title = card.name || card.title;
+    if (!isTv || !id || !title) return null;
+    return {
+      id: String(id),
+      title: String(title).slice(0, 180),
+      originalTitle: String(card.original_name || card.original_title || '').slice(0, 180),
+      source: String(card.source || 'tmdb').slice(0, 40),
+      media: 'tv',
+      selectedAt: new Date().toISOString()
+    };
+  }
+
+  function chooseSeries(card) {
+    var selected = buildSeriesFromCard(card);
+    if (!selected) {
+      notice('Будильник: не удалось определить сериал в карточке');
+      return false;
+    }
+    save('selected_series', selected);
+    notice('Сериал для будильника: ' + selected.title);
+    log('Series saved: ' + selected.source + ' / ' + selected.id);
+    return true;
+  }
+
+  function addSeriesButton(e) {
+    try {
+      if (!e || e.type !== 'complite' || !e.data || !e.data.movie) return;
+      if (!enabled('card_button', true)) return;
+      var series = buildSeriesFromCard(e.data.movie);
+      if (!series || !e.object || !e.object.activity ||
+          typeof e.object.activity.render !== 'function') return;
+      var root = e.object.activity.render();
+      if (!root || !root.find) return;
+      if (root.find('.lampa-alarm-card-button').length) return;
+
+      var button = $('<div class="full-start__button selector lampa-alarm-card-button">' +
+        '<svg viewBox="0 0 24 24" width="26" height="26" xmlns="http://www.w3.org/2000/svg" ' +
+        'fill="none" stroke="currentColor" stroke-width="2">' +
+        '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l4 2"/></svg>' +
+        '<span>В будильник</span></div>');
+      var current = selectedSeries();
+      function refreshLabel() {
+        var chosen = current && current.id === series.id &&
+          current.source === series.source;
+        button.find('span').text(chosen ? 'Выбран для будильника' : 'В будильник');
+      }
+      refreshLabel();
+      button.on('hover:enter', function () {
+        if (chooseSeries(e.data.movie)) {
+          current = selectedSeries();
+          refreshLabel();
+        }
+      });
+
+      // Use the standard button container, without replacing native video buttons.
+      var row = root.find('.full-start-new__buttons').first();
+      if (!row.length) row = root.find('.buttons--container').first();
+      if (row.length) row.append(button);
+      else log('Card buttons container not found');
+    } catch (err) {
+      log('Card button error: ' + err.message);
+    }
+  }
+
   function settingsSnapshot() {
     var dayValues = [];
     for (var i = 0; i < 7; i++) {
@@ -136,7 +228,8 @@
       wakeOnly: enabled('wake_only', false),
       minSleepMinutes: Number(read('min_sleep', '30')),
       wakeWindowMinutes: Number(read('wake_window', '3')),
-      lastWakeInfo: String(read('last_wake_info', 'не обнаружено'))
+      lastWakeInfo: String(read('last_wake_info', 'не обнаружено')),
+      selectedSeries: selectedSeries()
     };
   }
   function checkSchedule() {
@@ -226,6 +319,33 @@
       'Показывает последний обнаруженный в этой сессии длительный простой.', '', null,
       function () { notice(wakeStatusText()); });
 
+    addTitle('Сериал');
+    addParam('card_button', 'trigger', 'Кнопка «В будильник» в карточках',
+      'Показывать кнопку на страницах сериалов.', true);
+
+    Lampa.SettingsApi.addParam({
+      component: COMPONENT,
+      param: { type: 'static' },
+      field: { name: 'Выбранный сериал',
+        description: 'Выбери сериал через кнопку «В будильник» на его карточке.' },
+      onRender: function (item) {
+        var current = selectedSeries();
+        item.find('.settings-param__name').text(current ?
+          'Сериал: ' + current.title : 'Сериал пока не выбран');
+        if (current) item.find('.settings-param__descr').text(
+          'Источник карточки: ' + current.source + ', ID: ' + current.id);
+      }
+    });
+    addParam('series_info', 'button', 'Показать выбранный сериал',
+      'Показать название и источник сохранённой карточки.', '', null,
+      function () {
+        var chosen = selectedSeries();
+        notice(chosen ? 'Выбран: ' + chosen.title + ' (' + chosen.source + ')' :
+          'Будильник: сериал ещё не выбран');
+      });
+    addParam('series_clear', 'button', 'Сбросить выбранный сериал',
+      'После сброса выбери новый сериал в карточке.', '', null, clearSelectedSeries);
+
     addTitle('Планируемое воспроизведение (пока не активно)');
     addParam('source', 'select', 'Источник серии',
       'Сохранение предпочтения: воспроизведение подключим позже.', 'last',
@@ -254,7 +374,7 @@
     addParam('test', 'button', 'Проверить уведомление',
       'Покажет тестовое уведомление. Видео не запустится, громкость не изменится.', '', null,
       function () {
-        notice('Lampa Alarm 0.2.2: тест пройден, настройки доступны.');
+        notice('Lampa Alarm 0.3.0: тест пройден, настройки доступны.');
         log('Manual test performed');
       });
     addParam('status', 'button', 'Показать текущие настройки',
@@ -275,7 +395,7 @@
       setupSettings();
     } catch (e) {
       log('Setup failed: ' + e.message);
-      notice('Lampa Alarm 0.2.2: ошибка регистрации настроек');
+      notice('Lampa Alarm 0.3.0: ошибка регистрации настроек');
     }
     // Let the native Settings.main().update() build the menu entry and bind
     // the built-in hover:enter handler. Never append a data-static fallback.
@@ -283,6 +403,12 @@
       var main = Lampa.Settings.main();
       if (main && typeof main.update === 'function') main.update();
     } catch (e) { log('Native menu update error: ' + e.message); }
+    // The "full" event is emitted when a film/series card finishes rendering.
+    // Only TV-series cards receive the alarm button.
+    try {
+      if (Lampa.Listener && typeof Lampa.Listener.follow === 'function')
+        Lampa.Listener.follow('full', addSeriesButton);
+    } catch (e) { log('Card listener failed: ' + e.message); }
     setInterval(checkHeartbeat, 15000);
     window.addEventListener('focus', visibilityChanged);
     document.addEventListener('visibilitychange', visibilityChanged);
@@ -293,6 +419,9 @@
     window.LampaAlarm = {
       version: VERSION,
       getConfig: settingsSnapshot,
+      getSelectedSeries: selectedSeries,
+      selectSeries: chooseSeries,
+      clearSeries: clearSelectedSeries,
       getWakeState: function () {
         return wakeObservation ? {
           at: wakeObservation.at,
@@ -301,7 +430,7 @@
         } : null;
       },
       check: checkSchedule,
-      test: function () { notice('Lampa Alarm 0.2.2: тест пройден.'); }
+      test: function () { notice('Lampa Alarm 0.3.0: тест пройден.'); }
     };
     log('Initialized');
   }
