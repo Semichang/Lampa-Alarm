@@ -1,9 +1,9 @@
 (function () {
   'use strict';
 
-  // Lampa Alarm v0.6.1: one-shot startup test and manual TorrServer replay.
+  // Lampa Alarm v0.6.2: one-shot startup test and manual TorrServer replay.
   // Scheduled playback and Android system-volume control are still disabled.
-  var VERSION = '0.6.1';
+  var VERSION = '0.6.2';
   var COMPONENT = 'lampa_alarm';
   var PREFIX = 'la_';
   var ICON = '<svg viewBox="0 0 24 24" width="24" height="24" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v5l4 2" fill="none" stroke="currentColor" stroke-width="2"/></svg>';
@@ -18,8 +18,8 @@
     { id: 0, title: 'Воскресенье' }
   ];
 
-  if (window.__lampaAlarm061Loaded) return;
-  window.__lampaAlarm061Loaded = true;
+  if (window.__lampaAlarm062Loaded) return;
+  window.__lampaAlarm062Loaded = true;
 
   // Best-effort wake detection: this cannot identify the TV power-on reason.
   // Unknown/unobserved wake never triggers a wake-guarded alarm.
@@ -33,6 +33,7 @@
   var startupTimer = null;
   var sessionOnline = null;
   var ONLINE_TTL_MS = 120000;
+  var torrentLaunch = null;
 
   function markInteraction() { lastInteractionAt = Date.now(); }
 
@@ -891,6 +892,7 @@
 
   function onPlayerStart(data) {
     clearVideoHandlers();
+    onLaunchPlayerStart(data);
     var observation = capturePlayback(data, 'internal');
     if (!observation || !Lampa.PlayerVideo || !Lampa.PlayerVideo.listener) return;
 
@@ -925,11 +927,13 @@
   }
 
   function onPlayerExternal(data) {
+    onLaunchExternalPlayer(data);
     clearVideoHandlers();
     capturePlayback(data, 'external');
   }
 
   function onPlayerDestroy() {
+    onLaunchPlayerDestroy();
     if (currentPlayback && currentPlayback.playerMode === 'internal') {
       save('last_playback', currentPlayback);
       saveHistory(currentPlayback);
@@ -1024,107 +1028,353 @@
     return isBookmarkCurrent(torrentBookmark(), selectedSeries());
   }
 
-  function launchTorrentSeries() {
-    var selected = selectedSeries();
-    var bookmark = torrentBookmark();
-    if (!isBookmarkCurrent(bookmark, selected)) {
-      notice(bookmarkDiagnosticMessage());
-      return false;
-    }
-    if (!Lampa.Torserver || typeof Lampa.Torserver.files !== 'function' ||
-        typeof Lampa.Torserver.stream !== 'function' ||
-        !Lampa.Player || typeof Lampa.Player.play !== 'function') {
-      notice('На этом устройстве недоступен нужный API TorrServer');
-      return false;
-    }
-    if (launchInProgress ||
-        (Lampa.Player.opened && Lampa.Player.opened())) {
-      notice('Плеер уже запущен');
-      return false;
-    }
+  // The TV streams media; the torrent server owns the torrent cache.
+  // Launch is a finite state machine. Neither a file list nor opening an
+  // external Android player alone proves that video began playing.
+  function torrentWaitSeconds() {
+    var n=Number(read('torrent_wait_seconds','180'));
+    return n===60 || n===120 || n===180 || n===240 || n===300 ? n : 180;
+  }
 
-    launchInProgress = true;
-    notice('Будильник: загружаю сохранённую серию TorrServer...');
-    var finished = false;
-    var timeoutId;
-    function finish(message) {
-      if (finished) return;
-      finished = true;
-      launchInProgress = false;
-      if (typeof clearTimeout === 'function') clearTimeout(timeoutId);
-      if (message) {
-        notice(message);
-        log(message);
-      }
+  function launchReport() {
+    var item=storedValue('torrent_launch_status',null);
+    return item && typeof item==='object' ? item : null;
+  }
+
+  function launchReportText() {
+    var item=launchReport();
+    if(!item)return 'TorrServer: запуск пока не проверялся';
+    return 'TorrServer: '+item.message+
+      (item.progressPercent!==null && typeof item.progressPercent!=='undefined' ?
+        ' ('+item.progressPercent+'%)' : '')+
+      '; прошло '+item.elapsedSeconds+' с'+
+      (item.attempts>1?'; запросов '+item.attempts:'');
+  }
+
+  function launchState(job,stage,message,percentage) {
+    if(!job || job!==torrentLaunch || job.finished)return;
+    var now=Date.now();
+    var pct=typeof percentage==='number'&&isFinite(percentage) ?
+      Math.max(0,Math.min(100,Math.round(percentage))) : null;
+    var changed=stage!==job.stage;
+    job.stage=stage;
+    var text=plainLabel(message,180)||'Ожидание';
+    var report={
+      stage:stage,message:text,progressPercent:pct,
+      elapsedSeconds:Math.max(0,Math.round((now-job.startedAt)/1000)),
+      attempts:job.attempts,playerMode:job.playerMode||'',
+      updatedAt:new Date(now).toISOString()
+    };
+    job.lastReport=report;
+    if(changed || now-job.lastReportAt>=4000){
+      job.lastReportAt=now;
+      save('torrent_launch_status',report);
     }
+    if(changed) notice('TorrServer: '+text);
+  }
+
+  function launchSchedule(job,callback,delay) {
+    if(!job || job.finished)return null;
+    var id=setTimeout(function(){
+      var index=job.timers.indexOf(id);
+      if(index>=0)job.timers.splice(index,1);
+      if(job.finished || job!==torrentLaunch)return;
+      callback();
+    },delay);
+    job.timers.push(id);
+    return id;
+  }
+
+  function closeLaunchListeners(job) {
+    if(!job || !job.videoHandlers || !Lampa.PlayerVideo ||
+       !Lampa.PlayerVideo.listener)return;
+    var bus=Lampa.PlayerVideo.listener;
     try {
-      timeoutId = setTimeout(function () {
-        finish('TorrServer не ответил за 15 секунд');
-      }, 15000);
-      Lampa.Torserver.files(bookmark.hash, function (response) {
-        if (finished) return;
-        try {
-          var files = response && response.file_stats;
-          if (!Array.isArray(files)) return finish('TorrServer не вернул файлы');
-          var file = null;
-          for (var i = 0; i < files.length; i++) {
-            if (Number(files[i].id) === bookmark.fileIndex) {
-              file = files[i]; break;
+      bus.remove('canplay',job.videoHandlers.canplay);
+      bus.remove('timeupdate',job.videoHandlers.timeupdate);
+      bus.remove('error',job.videoHandlers.error);
+    }catch(e){log('Launch listener cleanup error: '+e.message)}
+    job.videoHandlers=null;
+  }
+
+  function completeLaunch(job,stage,message) {
+    if(!job || job.finished || job!==torrentLaunch)return;
+    launchState(job,stage,message,null);
+    job.finished=true;
+    job.timers.forEach(function(id){clearTimeout(id)});
+    job.timers=[];
+    if(job.preloader && typeof job.preloader.clear==='function') {
+      try{job.preloader.clear()}catch(e){}
+    }
+    closeLaunchListeners(job);
+    launchInProgress=false;
+  }
+
+  function abortTorrentLaunch() {
+    if(torrentLaunch && !torrentLaunch.finished) {
+      completeLaunch(torrentLaunch,'cancelled','Запуск остановлен пользователем');
+    } else notice('Сейчас нет ожидающего запуска TorrServer');
+  }
+
+  function matchesTorrentLaunch(job,data) {
+    if(!job || job.finished || !data)return false;
+    if(data===job.playData)return true;
+    var identity=torrentIdentityFromData(data);
+    return identity.hash===job.bookmark.hash &&
+       identity.fileIndex===job.bookmark.fileIndex;
+  }
+
+  function onLaunchPlayerStart(data) {
+    var job=torrentLaunch;
+    if(!matchesTorrentLaunch(job,data))return;
+    job.playerMode='internal';
+    launchState(job,'player_wait','Плеер открыт, ожидаю начало видео',null);
+    if(!Lampa.PlayerVideo || !Lampa.PlayerVideo.listener)return;
+    closeLaunchListeners(job);
+    var bus=Lampa.PlayerVideo.listener;
+    var handlers={
+      canplay:function(){
+        if(job.finished || job!==torrentLaunch)return;
+        launchState(job,'canplay','Видео загружено, проверяю воспроизведение',null);
+      },
+      timeupdate:function(event){
+        if(job.finished || job!==torrentLaunch)return;
+        var position=Number(event&&event.current);
+        if(isFinite(position)&&position>0.1)
+          completeLaunch(job,'playing','Воспроизведение подтверждено');
+      },
+      error:function(event){
+        if(job.finished || job!==torrentLaunch)return;
+        if(event&&event.fatal)
+          completeLaunch(job,'failed','Ошибка воспроизведения в плеере');
+      }
+    };
+    job.videoHandlers=handlers;
+    try{
+      bus.follow('canplay',handlers.canplay);
+      bus.follow('timeupdate',handlers.timeupdate);
+      bus.follow('error',handlers.error);
+    }catch(e){log('Player readiness monitoring error: '+e.message)}
+  }
+
+  function onLaunchExternalPlayer(data) {
+    var job=torrentLaunch;
+    if(!matchesTorrentLaunch(job,data))return;
+    job.playerMode='external';
+    // The WebView cannot confirm frames rendered in a separate Android app.
+    completeLaunch(job,'external',
+      'Ссылка передана внешнему плееру; запуск видео не подтверждён');
+  }
+
+  function onLaunchPlayerDestroy() {
+    var job=torrentLaunch;
+    if(job && !job.finished &&
+        (job.stage==='player_wait'||job.stage==='canplay'||job.stage==='opening'))
+      completeLaunch(job,'failed','Плеер закрыт до подтверждения воспроизведения');
+  }
+
+  function beginTorrentPlayer(job,streamUrl,file){
+    if(job.finished || job!==torrentLaunch)return;
+    var selected=job.series,bookmark=job.bookmark;
+    var card={
+      id:/^\d+$/.test(selected.id)?Number(selected.id):selected.id,
+      source:selected.source,name:selected.title,title:selected.title,
+      original_name:selected.originalTitle||selected.title,
+      original_title:selected.originalTitle||selected.title
+    };
+    var data={
+      url:streamUrl,
+      title:bookmark.episodeTitle||file.path.split(/[\\/]/).pop(),
+      card:card,movie:card,
+      torrent_hash:bookmark.hash,id:bookmark.fileIndex,
+      season:bookmark.season,episode:bookmark.episode
+    };
+    if(bookmark.season && bookmark.episode && Lampa.Timeline &&
+       Lampa.Timeline.link && Lampa.Timeline.view &&
+       Lampa.Utils && Lampa.Utils.hash){
+      try{
+        var meta=Lampa.Timeline.link(card,bookmark.season,bookmark.episode);
+        var hash=Lampa.Utils.hash([bookmark.season,
+          bookmark.season>10?':':'',bookmark.episode,card.original_name].join(''));
+        data.timeline=Lampa.Timeline.view(hash,meta);
+      }catch(e){log('Launch timeline metadata error: '+e.message)}
+    }
+    launchState(job,'opening','Передаю подготовленный поток плееру',null);
+    job.playData=data;
+    try{
+      // The player wrapper has its own short lock; keep the launch job alive
+      // until a player event confirms progress or the deadline is reached.
+      launchInProgress=false;
+      manualRunPlayer(data);
+      launchSchedule(job,function(){
+        if(job.stage==='opening')
+          launchState(job,'player_wait','Ожидаю ответа видеоплеера',null);
+      },4000);
+    }catch(e){
+      log('Torrent player launch error: '+e.message);
+      completeLaunch(job,'failed','Не удалось открыть видеоплеер');
+    }
+  }
+
+  function prebufferTorrent(job,streamUrl,file) {
+    if(job.finished || job!==torrentLaunch)return;
+    var shouldPreload=enabled('torrent_prebuffer',true) &&
+      /&preload(?:&|$)/i.test(streamUrl) &&
+      !/\.m3u8(?:\?|$)/i.test(streamUrl);
+    if(!shouldPreload || typeof Lampa.Reguest!=='function'){
+      beginTorrentPlayer(job,streamUrl,file);
+      return;
+    }
+    job.preloader=new Lampa.Reguest();
+    job.preloadFirst=true;
+    job.preloadErrors=0;
+    job.lastPercent=-1;
+    launchState(job,'prebuffer','Подключаюсь к раздаче, готовлю буфер',0);
+    function poll(){
+      if(job.finished || job!==torrentLaunch)return;
+      var initial=job.preloadFirst;
+      job.preloadFirst=false;
+      var url=initial?streamUrl:streamUrl.replace('&preload','&stat');
+      var settled=false;
+      var watchdog=launchSchedule(job,function(){
+        if(settled)return;settled=true;
+        retry('Нет ответа о буферизации');
+      },13000);
+      function once(fn){
+        if(settled||job.finished)return;
+        settled=true;
+        if(watchdog!==null)clearTimeout(watchdog);
+        fn();
+      }
+      function retry(reason){
+        if(job.finished)return;
+        job.preloadErrors++;
+        if(job.preloadErrors>=3 && job.lastPercent<0){
+          launchState(job,'prebuffer_fallback',
+            'Статистика недоступна, запускаю плеер для буферизации',null);
+          beginTorrentPlayer(job,streamUrl,file);
+          return;
+        }
+        launchState(job,'prebuffer',
+          reason+', ожидаю TorrServer',job.lastPercent>=0?job.lastPercent:0);
+        launchSchedule(job,poll,2500);
+      }
+      try{
+        job.preloader.timeout(10000);
+        job.preloader.silent(url,function(stats){
+          once(function(){
+            var total=Number(stats&&stats.preload_size);
+            var loaded=Number(stats&&stats.preloaded_bytes);
+            if(!(total>0) || !isFinite(loaded)){
+              // The native Lampa preloader also proceeds if no percentage
+              // is available, letting the player perform normal buffering.
+              launchState(job,'prebuffer_fallback',
+                'Размер буфера недоступен, передаю поток плееру',null);
+              beginTorrentPlayer(job,streamUrl,file);
+              return;
+            }
+            job.preloadErrors=0;
+            var percent=Math.max(0,Math.min(100,loaded*100/total));
+            job.lastPercent=percent;
+            if(percent>=95){
+              launchState(job,'prebuffer_done','Предзагрузка завершена',100);
+              beginTorrentPlayer(job,streamUrl,file);
+            }else{
+              launchState(job,'prebuffer',
+                'Подключаюсь к раздаче, буфер '+Math.round(percent)+'%',
+                percent);
+              launchSchedule(job,poll,1500);
+            }
+          });
+        },function(){
+          once(function(){retry('Не удалось получить статус предзагрузки')});
+        });
+      }catch(e){once(function(){retry('Ошибка получения статуса буфера')})}
+    }
+    poll();
+  }
+
+  function retrieveTorrentFile(job) {
+    if(job.finished || job!==torrentLaunch)return;
+    job.attempts++;
+    launchState(job,'metadata',
+      'Получаю список файлов, попытка '+job.attempts,null);
+    var settled=false;
+    var watchdog=launchSchedule(job,function(){
+      if(settled)return;
+      settled=true;
+      retry();
+    },8500);
+    function onDone(fn) {
+      if(settled||job.finished)return;
+      settled=true;
+      if(watchdog!==null)clearTimeout(watchdog);
+      fn();
+    }
+    function retry(){
+      if(job.finished)return;
+      launchSchedule(job,function(){retrieveTorrentFile(job)},2500);
+    }
+    try{
+      Lampa.Torserver.files(job.bookmark.hash,function(response){
+        onDone(function(){
+          var files=response&&response.file_stats;
+          if(!Array.isArray(files))return retry();
+          var file=null;
+          for(var i=0;i<files.length;i++){
+            if(Number(files[i].id)===job.bookmark.fileIndex){
+              file=files[i];break;
             }
           }
-          if (!file || typeof file.path !== 'string' || !file.path)
-            return finish('Сохранённая серия не найдена на TorrServer');
-          var url = Lampa.Torserver.stream(file.path, bookmark.hash, bookmark.fileIndex);
-          if (typeof url !== 'string' || !/^https?:\/\//i.test(url))
-            return finish('TorrServer не вернул действительную ссылку');
+          if(!file||typeof file.path!=='string'||!file.path)
+            return completeLaunch(job,'failed',
+              'Сохранённый файл отсутствует в торренте');
+          var streamUrl=Lampa.Torserver.stream(
+            file.path,job.bookmark.hash,job.bookmark.fileIndex);
+          if(typeof streamUrl!=='string'||!/^https?:\/\//i.test(streamUrl))
+            return completeLaunch(job,'failed','Не удалось получить адрес потока');
+          prebufferTorrent(job,streamUrl,file);
+        });
+      },function(){onDone(retry)});
+    }catch(e){onDone(retry)}
+  }
 
-          var card = {
-            id: /^\d+$/.test(selected.id) ? Number(selected.id) : selected.id,
-            source: selected.source,
-            name: selected.title,
-            title: selected.title,
-            original_name: selected.originalTitle || selected.title,
-            original_title: selected.originalTitle || selected.title
-          };
-          var data = {
-            url: url,
-            title: bookmark.episodeTitle ||
-              file.path.split(/[\\/]/).pop(),
-            card: card,
-            movie: card,
-            torrent_hash: bookmark.hash,
-            id: bookmark.fileIndex,
-            season: bookmark.season,
-            episode: bookmark.episode
-          };
-          if (bookmark.season && bookmark.episode &&
-              Lampa.Timeline && Lampa.Timeline.link &&
-              Lampa.Timeline.view && Lampa.Utils && Lampa.Utils.hash) {
-            try {
-              var meta = Lampa.Timeline.link(card, bookmark.season, bookmark.episode);
-              var h = Lampa.Utils.hash([
-                bookmark.season,
-                bookmark.season > 10 ? ':' : '',
-                bookmark.episode,
-                card.original_name
-              ].join(''));
-              data.timeline = Lampa.Timeline.view(h, meta);
-            } catch (e) { log('Timeline metadata error: ' + e.message); }
-          }
-          launchInProgress = false;
-          manualRunPlayer(data);
-          finish();
-        } catch (e) {
-          finish('Ошибка запуска серии TorrServer');
-          log('Playback error: ' + e.message);
-        }
-      }, function () { finish('Ошибка запроса файлов TorrServer'); });
-      return true;
-    } catch (e) {
-      finish('Не удалось обратиться к TorrServer');
-      log('TorrServer call failed: ' + e.message);
+  function launchTorrentSeries() {
+    var selected=selectedSeries();
+    var bookmark=torrentBookmark();
+    if(!isBookmarkCurrent(bookmark,selected)){
+      notice(bookmarkDiagnosticMessage());return false;
+    }
+    if(!Lampa.Torserver ||
+       typeof Lampa.Torserver.files!=='function' ||
+       typeof Lampa.Torserver.stream!=='function' ||
+       !Lampa.Player || typeof Lampa.Player.play!=='function'){
+      notice('TorrServer API недоступен на этом устройстве');return false;
+    }
+    if((torrentLaunch&&!torrentLaunch.finished) || launchInProgress ||
+       (Lampa.Player.opened&&Lampa.Player.opened())){
+      notice('Воспроизведение уже запускается или плеер открыт');
       return false;
     }
+    var job={
+      startedAt:Date.now(),attempts:0,stage:'',
+      finished:false,timers:[],lastReportAt:0,
+      series:selected,bookmark:bookmark,playerMode:'',
+      preloader:null,videoHandlers:null,playData:null
+    };
+    torrentLaunch=job;
+    launchInProgress=true;
+    launchState(job,'metadata','Подключаюсь к TorrServer',null);
+    launchSchedule(job,function(){
+      var message=job.stage==='metadata'?
+        'Не удалось получить список файлов за '+torrentWaitSeconds()+' секунд':
+        job.stage==='prebuffer'?
+          'Не удалось подготовить буфер за '+torrentWaitSeconds()+' секунд':
+          'Видео не начало воспроизводиться за '+torrentWaitSeconds()+' секунд';
+      completeLaunch(job,'failed',message);
+    },torrentWaitSeconds()*1000);
+    retrieveTorrentFile(job);
+    return true;
   }
 
   function launchOnlineSession() {
@@ -1241,7 +1491,8 @@
         { season: torrentBookmark().season, episode: torrentBookmark().episode,
           fileIndex: torrentBookmark().fileIndex, savedAt: torrentBookmark().savedAt } : null,
       startupTestEnabled: enabled('startup_test_enabled', false),
-      torrentBookmarkStatus: bookmarkDiagnosticMessage()
+      torrentBookmarkStatus: bookmarkDiagnosticMessage(),
+      torrentLaunchStatus: launchReport()
     };
   }
   function checkSchedule() {
@@ -1401,6 +1652,21 @@
       { '0': 'Сразу', '2': '2 минуты', '5': '5 минут', '10': '10 минут',
         '15': '15 минут', '20': '20 минут', '30': '30 минут' });
 
+    addTitle('Подготовка TorrServer');
+    addParam('torrent_wait_seconds','select','Максимальное ожидание видео',
+      'Включает ожидание ответа TorrServer, предзагрузку и запуск плеера.',
+      '180',{ '60':'1 минута','120':'2 минуты','180':'3 минуты',
+      '240':'4 минуты','300':'5 минут' });
+    addParam('torrent_prebuffer','trigger','Ждать предварительную загрузку',
+      'Если в Lampa включён режим preload, дождаться подготовки буфера.',
+      true);
+    addParam('torrent_launch_info','button','Состояние последнего запуска',
+      'Показывает этап, время ожидания и прогресс буфера.', '',null,
+      function(){notice(launchReportText());});
+    addParam('torrent_launch_cancel','button','Остановить подготовку',
+      'Отмена ожидания TorrServer без выключения телевизора.', '',null,
+      abortTorrentLaunch);
+
     addTitle('Проверка воспроизведения');
     addParam('torrent_file_check', 'button', 'Проверить сохранение файла TorrServer',
       'Покажет, сохранились ли хэш и индекс файла после выбора серии.', '', null,
@@ -1421,7 +1687,7 @@
     addParam('test', 'button', 'Проверить уведомление',
       'Покажет тестовое уведомление. Видео не запустится, громкость не изменится.', '', null,
       function () {
-        notice('Lampa Alarm 0.6.1: тест пройден, настройки доступны.');
+        notice('Lampa Alarm 0.6.2: тест пройден, настройки доступны.');
         log('Manual test performed');
       });
     addParam('status', 'button', 'Показать текущие настройки',
@@ -1442,7 +1708,7 @@
       setupSettings();
     } catch (e) {
       log('Setup failed: ' + e.message);
-      notice('Lampa Alarm 0.6.1: ошибка регистрации настроек');
+      notice('Lampa Alarm 0.6.2: ошибка регистрации настроек');
     }
     // Let the native Settings.main().update() build the menu entry and bind
     // the built-in hover:enter handler. Never append a data-static fallback.
@@ -1507,6 +1773,8 @@
           hasTorrentBookmark: canLaunchTorrent() };
       },
       testTorrentPlayback: launchTorrentSeries,
+      getTorrentLaunchStatus: launchReport,
+      cancelTorrentLaunch: abortTorrentLaunch,
       testOnlinePlayback: launchOnlineSession,
       armStartupTest: armOneShotTest,
       selectSeries: chooseSeries,
@@ -1519,7 +1787,7 @@
         } : null;
       },
       check: checkSchedule,
-      test: function () { notice('Lampa Alarm 0.6.1: тест пройден.'); }
+      test: function () { notice('Lampa Alarm 0.6.2: тест пройден.'); }
     };
     log('Initialized');
   }
