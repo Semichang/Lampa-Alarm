@@ -1438,8 +1438,14 @@
   }
 
   function onlineComponentSupported(component){
-    return component==='online_mod' ||
-      component==='online' || component==='online_prestige';
+    if(!/^[a-z][a-z0-9_-]{0,50}$/i.test(component||''))return false;
+    if(component==='online_mod' ||
+       component==='online' || component==='online_prestige')return true;
+    // Other installed online providers may follow the same list conventions.
+    // Only use a named component registered by Lampa, never an unknown one.
+    return Boolean(sourceComponentIsOnline(component) &&
+      Lampa.Component && typeof Lampa.Component.get==='function' &&
+      Lampa.Component.get(component));
   }
 
   function onlineStatus(){
@@ -1661,7 +1667,9 @@
         var root=event.object && event.object.activity &&
           event.object.activity.render();
         var selector=comp==='online_mod' ?
-          '.view--online_mod' : '.view--online';
+          '.view--online_mod' :
+          (comp==='online'||comp==='online_prestige') ?
+          '.view--online' : '.view--'+comp;
         var buttons=root && root.find ? root.find(selector) : null;
         prepareOnlineBalancer(job);
         // Normal Online and Prestige can share the same button CSS class.
